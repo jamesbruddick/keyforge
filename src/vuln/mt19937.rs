@@ -646,7 +646,18 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 use crate::scan::derive::Route;
-use crate::vuln::{Defaults, Expanded, Guide, Point, Space, Vulnerability};
+use crate::vuln::{Defaults, Expanded, Guide, KernelSpec, Point, Space, Vulnerability};
+
+/// The device half of `expand_seed`, shared by all three products.
+const KERNEL_SOURCE: &str = include_str!("../../kernels/vuln/mt19937.h");
+
+fn kernel_for(dists: &[Dist]) -> Option<KernelSpec> {
+    Some(KernelSpec {
+        source: KERNEL_SOURCE,
+        streams: dists.iter().map(|d| d.code()).collect(),
+        defines: Vec::new(),
+    })
+}
 
 /// The 32-bit seed space every generator here leaves behind.
 const SEED_SPACE: Space = Space::Integers { start: 0, end: 1 << 32 };
@@ -740,6 +751,10 @@ impl Vulnerability for MilkSad {
     fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>) {
         expand_seed(&[Dist::Libstdcxx, Dist::Libcxx], point, out)
     }
+
+    fn kernel(&self) -> Option<KernelSpec> {
+        kernel_for(&[Dist::Libstdcxx, Dist::Libcxx])
+    }
 }
 
 /// Trust Wallet Core before 3.1.1 -- CVE-2023-31290.
@@ -807,6 +822,10 @@ impl Vulnerability for TrustWallet {
 
     fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>) {
         expand_seed(&[Dist::Libcxx], point, out)
+    }
+
+    fn kernel(&self) -> Option<KernelSpec> {
+        kernel_for(&[Dist::Libcxx])
     }
 }
 
@@ -879,6 +898,10 @@ impl Vulnerability for PhpMt {
         // version, so both eras are in scope -- and the modern one is `Libcxx` rather
         // than a stream of its own precisely because it *is* that stream.
         expand_seed(&[Dist::Libcxx, Dist::Php], point, out)
+    }
+
+    fn kernel(&self) -> Option<KernelSpec> {
+        kernel_for(&[Dist::Libcxx, Dist::Php])
     }
 }
 

@@ -135,6 +135,24 @@ pub struct Guide {
     pub hit: &'static str,
 }
 
+/// A vulnerability's GPU kernel: its `vuln_expand`, and the constants it needs.
+///
+/// Everything else in the translation unit is shared, so this is the whole of what a
+/// vulnerability contributes to a device build. Returning `None` from
+/// [`Vulnerability::kernel`] means CPU-only, which a scan says plainly rather than
+/// silently running slower than asked.
+#[derive(Clone, Debug)]
+pub struct KernelSpec {
+    /// The kernel source, defining `vuln_expand(u32 lo, u32 hi, u32 stream, u8* out)`.
+    pub source: &'static str,
+    /// The byte streams this vulnerability walks, as codes the kernel understands. One
+    /// launch per stream, and the order must match [`Vulnerability::expand`]'s output --
+    /// that is how a device record maps back to the material the host re-derives.
+    pub streams: Vec<u32>,
+    /// Any further `#define`s the source needs.
+    pub defines: Vec<(&'static str, String)>,
+}
+
 /// A vulnerability that produces guessable Bitcoin keys.
 pub trait Vulnerability: Send + Sync {
     /// The name the CLI knows this by. Lowercase, hyphenated, stable: it goes in
@@ -187,6 +205,15 @@ pub trait Vulnerability: Send + Sync {
     /// nothing on the hot path. How the bytes are then interpreted is
     /// [`Defaults::routes`]' business, not this method's.
     fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>);
+
+    /// This vulnerability's GPU kernel, or `None` if it runs on the CPU only.
+    ///
+    /// A plugin without one is not a broken plugin: writing a correct kernel is real work,
+    /// and a scan that says "this one is CPU-only" is far better than one that quietly
+    /// derives the wrong wallets on a device.
+    fn kernel(&self) -> Option<KernelSpec> {
+        None
+    }
 }
 
 /// Every vulnerability the binary knows about.

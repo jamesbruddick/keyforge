@@ -130,24 +130,39 @@ INLINE Node bip32_ckd(Node parent, THREAD const u8* data) {
 }
 
 // A hardened child. Needs no public key, so it costs no EC work.
+//
+// `index` is the **full** child index, hardened bit already set -- the same convention as
+// `derive::derive_hardened` on the host and as `Segment::child` in the path grammar, which
+// is where the values in `child_values` come from. This used to OR the bit in itself, so
+// the two sides disagreed about what an index meant and only agreed by accident because
+// the caller always passed an unhardened one.
 INLINE Node bip32_hardened(Node parent, u32 index) {
     if (!parent.valid) return node_dead();
     u8 data[37];
     data[0] = 0;
     sc_to_be(parent.key, data + 1);
-    u32 h = index | 0x80000000u;
-    for (u32 i = 0; i < 4; i++) data[33 + i] = (u8)(h >> (24 - 8 * i));
+    for (u32 i = 0; i < 4; i++) data[33 + i] = (u8)(index >> (24 - 8 * i));
     return bip32_ckd(parent, data);
 }
 
 // ------------------------------------------------------------------ K0: entropy
 
-KERNEL k_entropy(BUF(u8, entropy, 0), CBUF(u32, base_seed, 1), CBUF(u32, offset, 2),
-                 CBUF(u32, dist, 3), CBUF(u32, seeds, 4) GID_PARAM) {
+// One thread per point. What a point expands to is the vulnerability's business: the
+// translation unit carries exactly one `kernels/vuln/*.h`, and it defines `vuln_expand`.
+// Everything below this kernel is shared, which is the whole reason adding a vulnerability
+// is a small piece of work rather than a second pipeline.
+//
+// The point arrives as two 32-bit halves because it can exceed 2^32 -- `java-random`'s
+// space is 2^48 -- and neither backend has a 64-bit ALU worth relying on. The carry is
+// done once here rather than inside every generator.
+KERNEL k_entropy(BUF(u8, entropy, 0), CBUF(u32, base_lo, 1), CBUF(u32, base_hi, 2),
+                 CBUF(u32, stream, 3), CBUF(u32, count, 4) GID_PARAM) {
     GID_INIT
-    if (gid >= seeds) return;
+    if (gid >= count) return;
+    u32 lo = base_lo + gid;
+    u32 hi = base_hi + (lo < base_lo ? 1u : 0u);
     u8 e[32];
-    mt_entropy(base_seed + gid, offset, dist, e);
+    vuln_expand(lo, hi, stream, e);
     for (u32 i = 0; i < 32; i++) entropy[gid * 32 + i] = e[i];
 }
 
@@ -218,27 +233,49 @@ KERNEL k_master(BUF(const u8, entropy, 0), BUF(const u8, bip39_seeds, 1),
     node_store(nodes, gid, n);
 }
 
-// ------------------------------------------------------------------ K3: the hardened prefix
+// -------------------------------------------------------------- K3: one hardened level
 //
-// m/purpose'/0'/account' -- three hardened steps and no EC work. `Bare` takes none of
-// them: it is the master node itself, which the chain and index levels then expand into
-// m/chain/index.
+// A hardened child needs no public key, so a whole level of them costs no EC work at all
+// and needs neither the multiply nor the inversion that a normal level does.
+//
+// This replaces a kernel that did exactly three hardened steps, because that was the
+// shape `m/purpose'/0'/account'` has and nothing else. A path is now parsed, so a spec can
+// have hardened levels anywhere and any number of them -- `m/48'/0'/0'/2'/{0,1}/{0..9}` has
+// four, `m/{0,1}/{0..9}` has none -- and the host dispatches this once per hardened
+// segment. `child_values` holds that segment's indices, hardened bit already set.
 
-KERNEL k_prefix(BUF(const u32, masters, 0), BUF(u32, out, 1), CBUF(u32, count, 2) GID_PARAM) {
+KERNEL k_hardened_level(BUF(const u32, parents, 0), BUF(u32, out, 1), CBUF(u32, count, 2),
+                        CBUF(u32, children, 3), BUF(const u32, child_values, 4),
+                        CBUF(u32, values_at, 5), CBUF(u32, out_base, 6) GID_PARAM) {
     GID_INIT
     if (gid >= count) return;
-    const u32 purposes[ARRAY_N(N_PURPOSES)] = PURPOSES;
+    // `out_base` is nonzero only for the last segment of a spec, which writes straight
+    // into that spec's region of the leaf array rather than into a level buffer.
+    u32 base = out_base + gid * children;
 
-    u32 purpose = gid % N_PURPOSES;
-    u32 parent = gid / N_PURPOSES;
-
-    Node n = node_load(masters, parent);
-    if (purposes[purpose] != PURPOSE_BARE) {
-        n = bip32_hardened(n, purposes[purpose]);
-        n = bip32_hardened(n, 0);
-        n = bip32_hardened(n, ACCOUNT);
+    Node p = node_load(parents, gid);
+    if (!p.valid) {
+        // A dead parent's slots still have to be written: the level is dense, and whatever
+        // the buffer held from the previous launch is not `valid = 0`.
+        for (u32 c = 0; c < children; c++) node_store(out, base + c, node_dead());
+        return;
     }
-    node_store(out, gid, n);
+    for (u32 c = 0; c < children; c++) {
+        node_store(out, base + c, bip32_hardened(p, child_values[values_at + c]));
+    }
+}
+
+// ----------------------------------------------------------- K3c: a level that is a copy
+//
+// The spec `m` -- the master node itself, with no derivation at all -- has no segment to
+// walk, so its masters *are* its leaves and only need moving into the leaf array. One
+// dispatch rather than a special case in the host loop.
+
+KERNEL k_copy_nodes(BUF(const u32, src, 0), BUF(u32, dst, 1), CBUF(u32, count, 2),
+                    CBUF(u32, dst_base, 3) GID_PARAM) {
+    GID_INIT
+    if (gid >= count) return;
+    node_store(dst, dst_base + gid, node_load(src, gid));
 }
 
 // --------------------------------------------------------------- K3b: raw private keys
@@ -451,10 +488,13 @@ INLINE Ge affine_at(DEVICE const u32* gej, DEVICE const u32* zinv, u32 i) {
 
 KERNEL k_ckd_normal(BUF(const u32, parents, 0), BUF(const u32, gej, 1), BUF(const u32, zinv, 2),
                     BUF(u32, out, 3), CBUF(u32, count, 4), CBUF(u32, children, 5),
-                    BUF(const u32, child_values, 6) GID_PARAM) {
+                    BUF(const u32, child_values, 6), CBUF(u32, values_at, 7),
+                    CBUF(u32, out_base, 8) GID_PARAM) {
     GID_INIT
     if (gid >= count) return;
-    u32 base = gid * children;
+    // See `k_hardened_level`: nonzero only for a spec's last segment, which lands in the
+    // leaf array directly.
+    u32 base = out_base + gid * children;
 
     Node p = node_load(parents, gid);
     if (!p.valid) {
@@ -469,7 +509,7 @@ KERNEL k_ckd_normal(BUF(const u32, parents, 0), BUF(const u32, gej, 1), BUF(cons
     ge_serialize(affine_at(gej, zinv, gid), data);
 
     for (u32 c = 0; c < children; c++) {
-        u32 index = child_values[c];
+        u32 index = child_values[values_at + c];
         for (u32 i = 0; i < 4; i++) data[33 + i] = (u8)(index >> (24 - 8 * i));
         node_store(out, base + c, bip32_ckd_keyed(p.key, key, data));
     }
@@ -486,8 +526,8 @@ KERNEL k_ckd_normal(BUF(const u32, parents, 0), BUF(const u32, gej, 1), BUF(cons
 
 KERNEL k_leaf(BUF(const u32, gej, 0), BUF(const u32, zinv, 1), BUF(const u64, filter, 2),
               CBUF(u64, filter_bits, 3), BUF(ATOMIC_U32, hit_count, 4), BUF(u8, hits, 5),
-              CBUF(u32, count, 6), CBUF(u32, base_seed, 7), CBUF(u32, hit_capacity, 8),
-              CBUF(u32, seeds, 9), CBUF(u32, filter_blocked, 10) GID_PARAM) {
+              CBUF(u32, count, 6), CBUF(u32, hit_capacity, 7), CBUF(u32, seeds, 8),
+              CBUF(u32, filter_blocked, 9) GID_PARAM) {
     GID_INIT
     if (gid >= count) return;
 
@@ -533,17 +573,33 @@ KERNEL k_leaf(BUF(const u32, gej, 0), BUF(const u32, zinv, 1), BUF(const u64, fi
         u32 slot = atomic_add_u32(hit_count, 1u);
         if (slot >= hit_capacity) continue; // overflow is reported by the host, not lost here
 
-        // Which seed produced this. The raw-privkey leaves sit after *every* HD leaf of
-        // the whole launch -- that is where `walk_levels` puts them, so that they share
-        // the leaf level's inversion -- which means the two regions index seeds
-        // differently. `Layout::raw_leaf_base` is the same boundary on the host.
-        u32 hd_total = HD_LEAVES_PER_SEED * seeds;
-        u32 seed = base_seed
-                 + ((gid < hd_total) ? (gid / HD_LEAVES_PER_SEED)
-                                     : ((gid - hd_total) / MAX(N_RAW_SIZES, 1u)));
+        // Which point produced this.
+        //
+        // The leaf array is a run of regions, one per derivation path plus one for keys
+        // that have no path at all, each holding `per_point` leaves for every point of the
+        // launch. So the point is found by locating the region and dividing -- a scan over
+        // a handful of compile-time constants, on a path taken once per filter hit rather
+        // than once per leaf.
+        //
+        // This is the *only* thing the host needs from a record, and the reason the record
+        // is so thin: the host re-derives the whole point through `derive::Deriver` and it
+        // is that walk, not this kernel, that produces everything a user reads. A wrong
+        // answer here cannot put a wrong secret in the output file; it can only make the
+        // host fail to confirm the record, which it counts.
+        const u32 region_base[ARRAY_N(N_REGIONS)] = REGION_BASES;
+        const u32 region_per_point[ARRAY_N(N_REGIONS)] = REGION_PER_POINT;
+        u32 point_index = 0;
+        for (u32 r = 0; r < N_REGIONS; r++) {
+            u32 lo = region_base[r] * seeds;
+            u32 hi = lo + region_per_point[r] * seeds;
+            if (gid >= lo && gid < hi) {
+                point_index = (gid - lo) / region_per_point[r];
+                break;
+            }
+        }
 
         DEVICE u8* rec = hits + slot * HIT_STRIDE;
-        for (u32 i = 0; i < 4; i++) rec[i] = (u8)(seed >> (8 * i));
+        for (u32 i = 0; i < 4; i++) rec[i] = (u8)(point_index >> (8 * i));
         for (u32 i = 0; i < 4; i++) rec[4 + i] = (u8)(gid >> (8 * i));
         rec[8] = (u8)f;
         rec[9] = 0; rec[10] = 0; rec[11] = 0;
@@ -563,12 +619,11 @@ KERNEL k_leaf(BUF(const u32, gej, 0), BUF(const u32, zinv, 1), BUF(const u64, fi
 KERNEL smoke(BUF(u32, out, 0) GID_PARAM) {
     GID_INIT
     const u32 entropy_sizes[ARRAY_N(N_ENTROPY_SIZES)] = ENTROPY_SIZES;
-    const u32 chains[ARRAY_N(N_CHAINS)] = CHAINS;
+    const u32 region_per_point[ARRAY_N(N_REGIONS)] = REGION_PER_POINT;
 
     u32 acc = 0;
     for (u32 i = 0; i < N_ENTROPY_SIZES; i++) acc += entropy_sizes[i];
-    for (u32 i = 0; i < N_CHAINS; i++) acc += chains[i];
-    acc += N_INDICES * 1000u;
+    for (u32 i = 0; i < N_REGIONS; i++) acc += region_per_point[i];
     acc += HASHES_PER_SEED * 1000000u;
 
     out[gid] = acc + gid;

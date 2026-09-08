@@ -21,7 +21,7 @@
 // that NVRTC rejects for an undeclared identifier -- which is exactly how one shipped.
 // Building the Metal side is not evidence about the CUDA side, and vice versa.
 
-#if defined(MILKSAD_METAL)
+#if defined(KEYFORGE_METAL)
 
 #include <metal_stdlib>
 using namespace metal;
@@ -53,7 +53,7 @@ INLINE uint atomic_add_u32(DEVICE ATOMIC_U32* p, uint v) {
 // kernels/sha512.h, which records what that cost to find out twice.
 INLINE uint mul_hi32(uint a, uint b) { return mulhi(a, b); }
 
-#elif defined(MILKSAD_CUDA)
+#elif defined(KEYFORGE_CUDA)
 
 #define DEVICE
 #define CONSTANT __constant__
@@ -82,11 +82,11 @@ INLINE unsigned int mul_hi32(unsigned int a, unsigned int b) { return __umulhi(a
 #define gid_value() (blockIdx.x * blockDim.x + threadIdx.x)
 
 #else
-#error "define MILKSAD_METAL or MILKSAD_CUDA"
+#error "define KEYFORGE_METAL or KEYFORGE_CUDA"
 #endif
 
 // How a kernel body gets its thread index, spelled once.
-#if defined(MILKSAD_METAL)
+#if defined(KEYFORGE_METAL)
 #define GID_PARAM , GID
 #define GID_INIT
 #else
@@ -114,7 +114,7 @@ INLINE unsigned int mul_hi32(unsigned int a, unsigned int b) { return __umulhi(a
 // out of a 35 MB table, seventeen per scalar, on the kernel that is 40% of the sweep --
 // exactly the access pattern `LDG` exists for. MSL infers the same non-aliasing from its
 // address spaces, so the Metal branch needs nothing.
-#if defined(MILKSAD_METAL)
+#if defined(KEYFORGE_METAL)
 #define BUF(type, name, n)  DEVICE type* name [[buffer(n)]]
 #define CBUF(type, name, n) CONSTANT type& name [[buffer(n)]]
 #else
@@ -125,7 +125,7 @@ INLINE unsigned int mul_hi32(unsigned int a, unsigned int b) { return __umulhi(a
 // Fixed-width names, so the source never says `unsigned long` and means two things.
 typedef unsigned int  u32;
 typedef unsigned char u8;
-#if defined(MILKSAD_METAL)
+#if defined(KEYFORGE_METAL)
 typedef ulong u64;
 // A 64-bit literal. Metal has no `long long`, so `ull` is not available here; CUDA has no
 // 64-bit `unsigned long` on Windows, so `ul` is not portable there. The suffix is spelled

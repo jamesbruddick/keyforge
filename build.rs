@@ -13,19 +13,6 @@ fn main() {
     // it invalidates the build -- otherwise a sweep silently re-measures the same binary.
     println!("cargo:rerun-if-env-changed=KEYFORGE_EC_WINDOW");
 
-    // The GPU backends have not been ported from the tool this grew out of yet. The
-    // feature flags are kept so the eventual port does not change anyone's command line,
-    // but accepting `--features cuda` and then quietly running on the CPU is worse than
-    // not offering it: the build succeeds, the scan runs, and it is ~40x slower than the
-    // person asking for it had every reason to expect.
-    if std::env::var_os("CARGO_FEATURE_GPU").is_some() {
-        panic!(
-            "\n\nGPU backends are not ported yet -- `--features gpu/metal/cuda/cuda12` \
-             would build but run entirely on the CPU.\nBuild without them for now:\n    \
-             cargo build --release\n\n"
-        );
-    }
-
     // Features reach a build script as environment variables, not as `cfg`.
     let thirteen = std::env::var_os("CARGO_FEATURE_CUDA").is_some();
     let twelve = std::env::var_os("CARGO_FEATURE_CUDA12").is_some();

@@ -120,10 +120,10 @@ INLINE Fe fe_add_u64(Fe a, u64 k) {
 // 1, p-1, p-2, (p-1)/2, 2^255, 2^256-1-C and C with each other, 400,000 random pairs and
 // 50,000 with p-1 held on one side. No mismatch, and that second carry was never 1.
 //
-// `MILKSAD_PORTABLE_FE_ADD` restores the portable body as the A/B control.
+// `KEYFORGE_PORTABLE_FE_ADD` restores the portable body as the A/B control.
 INLINE Fe fe_add(Fe a, Fe b) {
     Fe r;
-#if defined(MILKSAD_CUDA) && !defined(MILKSAD_PORTABLE_FE_ADD)
+#if defined(KEYFORGE_CUDA) && !defined(KEYFORGE_PORTABLE_FE_ADD)
     u32 c = 0;
     asm("add.cc.u32  %0, %9,  %17;\n\t"
         "addc.cc.u32 %1, %10, %18;\n\t"
@@ -186,7 +186,7 @@ INLINE Fe fe_sub_kC(Fe a, u64 k) {
 // p - a, which is -a for every a but zero.
 INLINE Fe fe_neg(Fe a) {
     if (fe_is_zero(a)) return a;
-#if defined(MILKSAD_CUDA) && !defined(MILKSAD_PORTABLE_FE_ADD)
+#if defined(KEYFORGE_CUDA) && !defined(KEYFORGE_PORTABLE_FE_ADD)
     // p's limbs as immediates: only the bottom two differ from 0xffffffff. Nothing reads
     // the carry out, because a is below p and this cannot borrow -- see the note on
     // `fe_sub` for why that is the whole trick.
@@ -241,7 +241,7 @@ INLINE Fe fe_neg(Fe a) {
 // the whole point. `fe_neg` is not only paid here either -- `ge_negate` calls it for every
 // negative comb digit, which is about half of every row of `ec_mul_gen`.
 INLINE Fe fe_sub(Fe a, Fe b) {
-#if defined(MILKSAD_CUDA) && !defined(MILKSAD_PORTABLE_FE_ADD)
+#if defined(KEYFORGE_CUDA) && !defined(KEYFORGE_PORTABLE_FE_ADD)
     return fe_add(a, fe_neg(b));
 #else
     Fe r;
@@ -344,12 +344,12 @@ INLINE u64 fe_add_kC(THREAD u32* r, u64 k) {
 // triangle squaring is the next thing to write, and it would now be earning its keep rather
 // than duplicating the optimiser.
 //
-// `MILKSAD_PORTABLE_FE_MUL` restores the portable body, so the A/B is an environment
+// `KEYFORGE_PORTABLE_FE_MUL` restores the portable body, so the A/B is an environment
 // variable rather than an edit:
 //
-//     MILKSAD_KERNEL_DEFINES=-DMILKSAD_PORTABLE_FE_MUL \
+//     KEYFORGE_KERNEL_DEFINES=-DKEYFORGE_PORTABLE_FE_MUL \
 //         ./target/release/milksad-scan bench -f addresses.blf --gpu only --seeds 3000000
-#if defined(MILKSAD_CUDA) && !defined(MILKSAD_PORTABLE_FE_MUL)
+#if defined(KEYFORGE_CUDA) && !defined(KEYFORGE_PORTABLE_FE_MUL)
 #define FE_MUL_PTX 1
 
 #define FE_MUL_ROW_(W0, W1, W2, W3, W4, W5, W6, W7, W8, AI,                    \

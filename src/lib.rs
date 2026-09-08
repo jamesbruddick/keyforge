@@ -25,6 +25,7 @@
 //! A change to a vulnerability cannot reach the arithmetic.
 
 pub mod crypto;
+pub mod gpu;
 pub mod scan;
 pub mod target;
 pub mod ui;

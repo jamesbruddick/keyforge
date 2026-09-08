@@ -254,12 +254,39 @@ cargo test --features metal    # or --features cuda / --features cuda12
 
 ```
 cargo build --release                      # CPU only
+cargo build --release --features metal     # Apple GPUs
+cargo build --release --features cuda      # NVIDIA, CUDA 13.x driver
+cargo build --release --features cuda12    # NVIDIA, driver older than 580
 ```
 
-**GPU support is not ported yet.** The `metal`, `cuda` and `cuda12` feature flags are
-reserved for it and currently fail the build with a message saying so, rather than
-building successfully and then running everything on the CPU at a fortieth of the speed
-you asked for.
+Kernels are compiled from source at run time, so no build needs a GPU toolchain and one
+binary runs on a freshly rented box.
+
+## GPU
+
+```
+keyforge scan --vuln milksad -f funded.bf --gpu        # device and CPU together
+keyforge scan --vuln milksad -f funded.bf --gpu only   # device alone
+```
+
+The device is a **filter** and the CPU is the **oracle**. A device record says "look at
+this point" and nothing more; the host re-derives that point through the CPU walk, and
+only what the CPU derives ever reaches `matches.txt`. So a wrong kernel cannot write a
+wrong secret — but it *can* silently miss wallets, which has no symptom at all. The
+`unconfirmed` counter is that symptom: records the CPU could not reproduce. It should read
+zero, and a non-zero count is reported loudly at the end of a scan.
+
+Two things follow from the filter having to be resident:
+
+* On NVIDIA the filter is copied to VRAM, so **it must fit there**. Host-mapped memory is
+  refused deliberately — at roughly 2,300 random probes per point, a filter read over PCIe
+  caps a sweep below what a laptop CPU manages.
+* On Apple silicon the filter is bound without copying, so one set of pages serves the GPU
+  and every CPU worker at once.
+
+Not every vulnerability has a kernel yet. `keyforge scan --gpu` says so plainly for the
+ones that do not, rather than running slower than you asked; the MT19937 family
+(`milksad`, `trust-wallet`, `php-mt`) all have one.
 
 ## Memory
 

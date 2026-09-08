@@ -181,6 +181,16 @@ struct ScanArgs {
     /// Ignore any existing checkpoint and start from the beginning.
     #[arg(long)]
     restart: bool,
+
+    /// Use the GPU. `both` also walks points on the CPU; `only` leaves the CPU to
+    /// confirm what the device finds.
+    #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "both",
+          hide = !cfg!(feature = "gpu"))]
+    gpu: Option<keyforge::gpu::Mode>,
+
+    /// Points per device launch. Sized from the device's memory when not given.
+    #[arg(long, value_name = "N")]
+    gpu_batch: Option<usize>,
 }
 
 fn main() -> std::process::ExitCode {
@@ -253,6 +263,18 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
         }
         (start, end)
     };
+
+    if args.gpu.is_some() && !cfg!(feature = "gpu") {
+        bail!(
+            "this binary was built without GPU support. Rebuild with one of:\n    \
+             cargo build --release --features metal     (Apple)\n    \
+             cargo build --release --features cuda      (NVIDIA, CUDA 13.x driver)\n    \
+             cargo build --release --features cuda12    (NVIDIA, older driver)"
+        );
+    }
+    if args.gpu.is_some() && corpus {
+        bail!("a corpus is walked on the CPU; drop --gpu");
+    }
 
     let threads = args.threads.unwrap_or_else(|| {
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
@@ -342,6 +364,8 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
         threads,
         block: args.block,
         restart: args.restart,
+        gpu: args.gpu,
+        gpu_batch: args.gpu_batch,
     };
 
     let report = if corpus {
@@ -370,6 +394,17 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
             ui::commas(report.locations)
         ),
     );
+    // Should always be zero. See `ScanReport::unconfirmed`: the device is a filter and
+    // the CPU is the oracle, so this counts records the two disagree about -- which is the
+    // only symptom a silently-wrong kernel has.
+    if report.unconfirmed > 0 {
+        ui.warn(&format!(
+            "{} device records could not be reproduced on the CPU. The two \
+             implementations have diverged; treat this sweep as incomplete and please \
+             report it.",
+            ui::commas(report.unconfirmed)
+        ));
+    }
     if !report.finished {
         ui.cont("re-run the same command to pick up where this stopped");
     }

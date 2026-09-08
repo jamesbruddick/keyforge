@@ -52,11 +52,25 @@ pub struct ScanConfig {
     pub threads: usize,
     pub block: Option<u64>,
     pub restart: bool,
+    /// Whether to use a device, and whether the CPU walks points of its own alongside it.
+    pub gpu: Option<crate::gpu::Mode>,
+    /// Points per device launch. `None` sizes it from the device's memory.
+    pub gpu_batch: Option<usize>,
 }
 
 /// What a finished or interrupted scan reports back.
 pub struct ScanReport {
     pub points_done: u64,
+    /// Device records the CPU could not reproduce.
+    ///
+    /// Should be zero, always. The device is a filter and the CPU is the oracle: a record
+    /// says "look at this point", the host re-derives it, and only what the *CPU* derives
+    /// reaches `matches.txt`. So a wrong kernel cannot write a wrong secret -- but it can
+    /// silently miss wallets, and that has no symptom at all. This counter is the symptom:
+    /// a launch producing records the CPU cannot reproduce means the two implementations
+    /// have diverged, and zero across a multi-day sweep is a continuous free check on the
+    /// whole kernel set.
+    pub unconfirmed: u64,
     pub total_points: u128,
     pub candidates: u64,
     pub locations: u64,
@@ -164,6 +178,7 @@ pub fn run(
         ui.notice("nothing to do", "this range has already been walked");
         return Ok(ScanReport {
             points_done: 0,
+            unconfirmed: 0,
             total_points,
             candidates: 0,
             locations: 0,
@@ -183,10 +198,43 @@ pub fn run(
     // be redrawn with the count from the last tick -- reading "0 candidates" directly
     // below the candidate that had just been announced.
     let found = AtomicBool::new(false);
+    let unconfirmed = AtomicU64::new(0);
+
+    // A device claims blocks from the same queue the CPU workers do, so `--gpu both` needs
+    // no separate range and no second checkpoint: whichever finishes a block first takes
+    // the next one.
+    let mut device = match config.gpu {
+        Some(_) => Some(open_device(ui, vuln, scope, config, target, total_points)?),
+        None => None,
+    };
+    let cpu_workers = match config.gpu {
+        Some(crate::gpu::Mode::Only) => 0,
+        _ => config.threads,
+    };
 
     let began = Instant::now();
     std::thread::scope(|s| {
-        for _ in 0..config.threads {
+        if let Some(gpu) = device.as_mut() {
+            let (target, scope, sink, stop, found) = (target, scope, &sink, &stop, &found);
+            let (next_block, completed, watermark, points_done, unconfirmed) =
+                (&next_block, &completed, &watermark, &points_done, &unconfirmed);
+            s.spawn(move || {
+                let result = run_device(
+                    gpu, vuln, target, scope, sink, found, stop, next_block, completed,
+                    watermark, points_done, unconfirmed, config, block, total_blocks,
+                );
+                if let Err(error) = result {
+                    // A dead device must not look like a finished sweep. Stopping every
+                    // other worker is what keeps the checkpoint honest: the watermark
+                    // holds below the blocks this worker had claimed, so a resumed run
+                    // rescans them.
+                    stop.store(true, Ordering::SeqCst);
+                    eprintln!("\ndevice worker failed: {error:#}");
+                }
+            });
+        }
+
+        for _ in 0..cpu_workers {
             let (target, scope, sink, stop, found) = (target, scope, &sink, &stop, &found);
             let (next_block, completed, watermark, points_done) =
                 (&next_block, &completed, &watermark, &points_done);
@@ -376,12 +424,263 @@ pub fn run(
     let sink = sink.lock().unwrap();
     Ok(ScanReport {
         points_done: points_done.load(Ordering::Relaxed),
+        unconfirmed: unconfirmed.load(Ordering::Relaxed),
         total_points,
         candidates: sink.candidates,
         locations: sink.locations,
         elapsed: began.elapsed(),
         finished,
     })
+}
+
+/// Open the device and put the filter on it.
+///
+/// Deliberately eager, and before any point is walked: a runtime-compiled kernel set can
+/// only fail at runtime, and the moment to find out is during startup next to the filter
+/// load rather than two hours into a detached sweep.
+fn open_device(
+    ui: &Ui,
+    vuln: &'static dyn Vulnerability,
+    scope: &Scope,
+    config: &ScanConfig,
+    target: &Target,
+    total_points: u128,
+) -> Result<crate::gpu::Gpu> {
+    use crate::gpu::{Batch, Gpu};
+
+    if vuln.kernel().is_none() {
+        anyhow::bail!(
+            "`{}` has no GPU kernel yet, so it runs on the CPU only. Drop --gpu to scan it.",
+            vuln.id()
+        );
+    }
+    let batch = match config.gpu_batch {
+        Some(n) => Batch::Fixed(n),
+        None => Batch::Auto {
+            filter_bytes: target.primary().size_bytes() as u64,
+            seeds_in_range: total_points.min(u64::MAX as u128) as u64,
+        },
+    };
+    let mut gpu = Gpu::open(scope, vuln, batch)?;
+    ui.row("device", &gpu.name());
+    if let Some(compiler) = gpu.compiler() {
+        ui.row("compiler", &compiler);
+    }
+    gpu.bind_filter(target.primary())?;
+    Ok(gpu)
+}
+
+/// One run of blocks' worth of device records, waiting for the CPU to confirm them.
+struct Claim {
+    /// The blocks this covers, contiguous. All of them are marked complete together, once
+    /// their records have been confirmed.
+    units: std::ops::Range<u64>,
+    base: u128,
+    /// `(stream, point offset from `base`, hash)` for each record.
+    hits: Vec<(usize, u32, [u8; 20])>,
+}
+
+/// Drive the device, and hand what it finds to the CPU to confirm.
+///
+/// The split is the whole design. At a real filter's false-positive rate a launch of
+/// tens of thousands of points passes a few dozen, and re-deriving each of those on the
+/// CPU costs milliseconds -- enough that doing it on this thread would leave the device
+/// idle for a large part of every second. So records go over a **bounded** channel to
+/// confirm workers, and the bound is what stops a slow CPU turning into unbounded memory.
+///
+/// A block is marked complete by whoever confirms it, never by this function. Marking it
+/// here would let the watermark pass a block whose records had not been written yet, and a
+/// checkpoint taken in that window would describe a hole.
+#[allow(clippy::too_many_arguments)]
+fn run_device<'a>(
+    gpu: &mut crate::gpu::Gpu,
+    vuln: &'static dyn Vulnerability,
+    target: &'a Target,
+    scope: &'a Scope,
+    sink: &'a Mutex<MatchSink<'a>>,
+    found: &'a AtomicBool,
+    stop: &AtomicBool,
+    next_block: &AtomicU64,
+    completed: &Mutex<BTreeSet<u64>>,
+    watermark: &AtomicU64,
+    points_done: &AtomicU64,
+    unconfirmed: &'a AtomicU64,
+    config: &ScanConfig,
+    block: u64,
+    total_blocks: u64,
+) -> Result<()> {
+    let streams = {
+        let mut out = Vec::new();
+        vuln.expand(Point::Integer(config.start), &mut out);
+        out.len().max(1)
+    };
+    let capacity = gpu.layout().capacity;
+
+    // How many blocks it takes to fill a launch.
+    //
+    // A block is sized for a CPU worker -- small enough that Ctrl-C does not lose much and
+    // that threads stay balanced -- and a device wants thousands of points at once. Taking
+    // one block per launch means launching a block's worth however large the device is,
+    // which on a short range is a few hundred points and leaves the GPU almost idle: it
+    // measured 297 points/s against the CPU's 946 before this existed. So the device
+    // claims a contiguous *run* of blocks and launches across it.
+    let blocks_per_claim = (capacity as u64).div_ceil(block).max(1);
+
+    // Two in flight: one being confirmed while the next is being launched. More would only
+    // buy memory.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Claim>(2);
+    let rx = Mutex::new(rx);
+    let workers = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) / 4)
+        .clamp(1, 4);
+
+    std::thread::scope(|s| -> Result<()> {
+        for _ in 0..workers {
+            let (rx, sink, target, scope) = (&rx, sink, target, scope);
+            s.spawn(move || {
+                let mut deriver = Deriver::new();
+                let mut expanded = Vec::new();
+                loop {
+                    let claim = {
+                        let guard = rx.lock().unwrap();
+                        match guard.recv() {
+                            Ok(claim) => claim,
+                            Err(_) => break,
+                        }
+                    };
+
+                    // Per (stream, point): the same point on two streams is two different
+                    // wallets and two separate walks.
+                    let mut wanted: Vec<(usize, u32)> =
+                        claim.hits.iter().map(|(s, p, _)| (*s, *p)).collect();
+                    wanted.sort_unstable();
+                    wanted.dedup();
+
+                    for (stream, offset) in wanted {
+                        let point = claim.base + offset as u128;
+                        expanded.clear();
+                        vuln.expand(Point::Integer(point), &mut expanded);
+                        let Some(material) = expanded.get(stream).copied() else {
+                            continue;
+                        };
+
+                        // Everything the CPU derives for this point, so each device record
+                        // can be held against an exact hash rather than against "this
+                        // point produced something".
+                        let mut produced: Vec<[u8; 20]> = Vec::new();
+                        let mut candidates = Candidates {
+                            target,
+                            scope,
+                            sink,
+                            found,
+                            vuln: vuln.id(),
+                            base: point,
+                            stream,
+                            materials: [material; derive::POINTS_PER_BATCH],
+                        };
+                        deriver.walk_batch(
+                            &[material],
+                            scope,
+                            &mut Confirming { inner: &mut candidates, produced: &mut produced },
+                        );
+                        produced.sort_unstable();
+
+                        for (_, _, hash) in claim
+                            .hits
+                            .iter()
+                            .filter(|(s, p, _)| *s == stream && *p == offset)
+                        {
+                            if produced.binary_search(hash).is_err() {
+                                unconfirmed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+
+                    // Only now are the blocks finished.
+                    let mut done = completed.lock().unwrap();
+                    for unit in claim.units {
+                        done.insert(unit);
+                    }
+                    let mut mark = watermark.load(Ordering::Relaxed);
+                    while done.remove(&mark) {
+                        mark += 1;
+                    }
+                    watermark.store(mark, Ordering::Relaxed);
+                }
+            });
+        }
+
+        let result = (|| -> Result<()> {
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let first = next_block.fetch_add(blocks_per_claim, Ordering::Relaxed);
+                if first >= total_blocks {
+                    break;
+                }
+                let last = (first + blocks_per_claim).min(total_blocks);
+                let lo = config.start + first as u128 * block as u128;
+                let hi = (config.start + last as u128 * block as u128).min(config.end);
+
+                let mut hits = Vec::new();
+                let mut interrupted = false;
+                for stream in 0..streams {
+                    let mut at = lo;
+                    while at < hi {
+                        if stop.load(Ordering::Relaxed) {
+                            interrupted = true;
+                            break;
+                        }
+                        let n = ((hi - at) as usize).min(capacity);
+                        for hit in gpu.run(at, n, stream)? {
+                            // The record's point is an offset within *its* launch; make it
+                            // an offset within the block, which is what the base says.
+                            let offset = (at - lo) as u32 + hit.point;
+                            hits.push((stream, offset, hit.hash));
+                        }
+                        if stream == 0 {
+                            points_done.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        at += n as u128;
+                    }
+                    if interrupted {
+                        break;
+                    }
+                }
+                // An abandoned block is not a finished block, so it is not handed on to be
+                // marked complete: the watermark holds below it and a resume rescans it.
+                if interrupted {
+                    break;
+                }
+                if tx.send(Claim { units: first..last, base: lo, hits }).is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+
+        // Dropping the sender is what lets the confirm workers finish and the scope join.
+        drop(tx);
+        result
+    })
+}
+
+/// Wraps the scan's visitor to also record everything the CPU derived, so a device record
+/// can be checked against an exact hash.
+struct Confirming<'a, 'b> {
+    inner: &'a mut Candidates<'b>,
+    produced: &'a mut Vec<[u8; 20]>,
+}
+
+impl derive::Visitor for Confirming<'_, '_> {
+    fn select(&mut self, hashes: &[[u8; 20]], hits: &mut Vec<u32>) {
+        self.produced.extend_from_slice(hashes);
+        self.inner.select(hashes, hits);
+    }
+
+    fn visit(&mut self, location: &Location, hash: &[u8; 20], phrase: &str) {
+        self.inner.visit(location, hash, phrase);
+    }
 }
 
 /// Hands out blocks of corpus lines, in order, to whichever worker asks next.
@@ -664,6 +963,7 @@ pub fn run_corpus(
     let points_done = points_done.load(Ordering::Relaxed);
     Ok(ScanReport {
         points_done,
+        unconfirmed: 0,
         total_points: points_done as u128,
         candidates: sink.candidates,
         locations: sink.locations,
@@ -854,6 +1154,8 @@ mod tests {
             threads: 2,
             block: Some(4),
             restart: true,
+            gpu: None,
+            gpu_batch: None,
         };
 
         let report = run(
@@ -977,6 +1279,8 @@ mod corpus_tests {
             threads: 2,
             block: Some(2),
             restart: true,
+            gpu: None,
+            gpu_batch: None,
         };
 
         let fp = corpus_fingerprint(&corpus).unwrap();
