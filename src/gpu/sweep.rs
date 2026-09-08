@@ -98,63 +98,116 @@ fn scopes() -> Vec<(&'static str, Scope)> {
     ]
 }
 
-/// The device must report every point the CPU says matches, and no others.
+/// One sweep, held against the CPU: does the device report every point the CPU says
+/// matches, and no others?
 ///
 /// The filter is built from hashes the CPU actually derived, so there is something real to
 /// find rather than a sweep of an empty filter that would pass by finding nothing. Points
 /// are compared rather than records: that is the whole of what a record is for.
+///
+/// Returns `false` when there is no device, so a caller can stop rather than repeat the
+/// skip message once per case.
+#[must_use]
+fn device_agrees_with_cpu(
+    name: &str,
+    v: &'static dyn Vulnerability,
+    scope: &Scope,
+    points: std::ops::Range<u128>,
+) -> bool {
+    assert_eq!(scope.validate(), Ok(()), "{name} is not a valid scope");
+
+    let cpu = cpu_hashes(v, scope, 0, points.clone());
+    assert!(!cpu.is_empty(), "{name} derived nothing");
+
+    // Plant a handful of the CPU's own hashes, spread across the range so the match is
+    // not all in one point or one region of the leaf array.
+    let planted: Vec<[u8; 20]> = cpu
+        .iter()
+        .step_by(cpu.len() / 7 + 1)
+        .map(|(_, h)| *h)
+        .collect();
+    let want: BTreeSet<u128> = cpu
+        .iter()
+        .filter(|(_, h)| planted.contains(h))
+        .map(|(p, _)| *p)
+        .collect();
+    assert!(want.len() > 1, "{name} planted hashes from only one point");
+
+    let filter = filter_of(&format!("sweep-{}.bf", name.replace(' ', "-")), &planted);
+    let target = Target::new(filter, None);
+
+    let count = (points.end - points.start) as usize;
+    let mut gpu = match Gpu::open(scope, v, Batch::Fixed(count)) {
+        Ok(gpu) => gpu,
+        Err(e) if is_unavailable(&e) => {
+            println!("skipping: {e}");
+            return false;
+        }
+        Err(e) => panic!("{name}: {e}"),
+    };
+    gpu.bind_filter(target.primary()).expect("bind the filter");
+
+    let hits = gpu
+        .run(points.start, count, 0)
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    // `Hit::point` is an offset within the launch, not an absolute point -- the host
+    // adds the base back, and so must this. Every other case here starts at 0, where
+    // the two are the same; the plugins whose spaces start at 1 make it visible.
+    let got: BTreeSet<u128> = hits.iter().map(|h| points.start + h.point as u128).collect();
+
+    assert_eq!(got, want, "{name}: the device and the CPU disagree on which points match");
+
+    // Every record's hash must be one the CPU derived for that point. A record the host
+    // cannot confirm is counted in a real scan; here it is a failure.
+    for hit in &hits {
+        let point = points.start + hit.point as u128;
+        assert!(
+            cpu.iter().any(|(p, h)| *p == point && h == &hit.hash),
+            "{name}: point {point} reported a hash the CPU never derived"
+        );
+    }
+    true
+}
+
+/// The pipeline, across the path shapes the scope grammar can express.
 #[test]
 fn the_device_finds_the_points_the_cpu_finds() {
-    let points = 0u128..64;
-
     for (name, scope) in scopes() {
-        assert_eq!(scope.validate(), Ok(()), "{name} is not a valid scope");
+        if !device_agrees_with_cpu(name, &MilkSad, &scope, 0..64) {
+            return;
+        }
+    }
+}
 
-        let cpu = cpu_hashes(&MilkSad, &scope, 0, points.clone());
-        assert!(!cpu.is_empty(), "{name} derived nothing");
+/// The same claim for **every plugin that ships a kernel**, each at its own default
+/// scope, over a short range at the bottom of its own space.
+///
+/// The test above varies the path shape and holds the vulnerability fixed; this varies
+/// the vulnerability and lets each one pick the scope it actually scans with. Both halves
+/// matter, because a plugin's kernel and the scope it narrows to are compiled into the
+/// same translation unit: `low-int` and `repeated-byte` produce a pipeline with no BIP39
+/// and no tree at all, and nothing else here builds that.
+///
+/// This is a stronger claim than `parity`'s `vuln_expand` diff. Parity says the device
+/// computes the same 32 bytes; this says those bytes go on to find the same wallets.
+#[test]
+fn every_plugin_sweeps_the_way_the_cpu_does() {
+    use crate::vuln::Space;
 
-        // Plant a handful of the CPU's own hashes, spread across the range so the match
-        // is not all in one point or one region of the leaf array.
-        let planted: Vec<[u8; 20]> = cpu
-            .iter()
-            .step_by(cpu.len() / 7 + 1)
-            .map(|(_, h)| *h)
-            .collect();
-        let want: BTreeSet<u128> = cpu
-            .iter()
-            .filter(|(_, h)| planted.contains(h))
-            .map(|(p, _)| *p)
-            .collect();
-        assert!(want.len() > 1, "{name} planted hashes from only one point");
-
-        let filter = filter_of(&format!("sweep-{}.bf", name.replace(' ', "-")), &planted);
-        let target = Target::new(filter, None);
-
-        let mut gpu = match Gpu::open(&scope, &MilkSad, Batch::Fixed(points.end as usize)) {
-            Ok(gpu) => gpu,
-            Err(e) if is_unavailable(&e) => {
-                println!("skipping: {e}");
-                return;
-            }
-            Err(e) => panic!("{name}: {e}"),
+    for v in crate::vuln::registry() {
+        if v.kernel().is_none() {
+            continue;
+        }
+        let Space::Integers { start, .. } = v.space() else {
+            continue;
         };
-        gpu.bind_filter(target.primary()).expect("bind the filter");
+        let mut scope = Scope::default();
+        v.defaults().apply(&mut scope);
 
-        let hits = gpu
-            .run(points.start, points.end as usize, 0)
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
-        let got: BTreeSet<u128> = hits.iter().map(|h| h.point as u128).collect();
-
-        assert_eq!(got, want, "{name}: the device and the CPU disagree on which points match");
-
-        // Every record's hash must be one the CPU derived for that point. A record the
-        // host cannot confirm is counted in a real scan; here it is a failure.
-        for hit in &hits {
-            let point = hit.point as u128;
-            assert!(
-                cpu.iter().any(|(p, h)| *p == point && h == &hit.hash),
-                "{name}: point {point} reported a hash the CPU never derived"
-            );
+        // Short, because this compiles a kernel set per plugin. 32 points is enough to
+        // plant hashes from several distinct ones, which is what the assertion needs.
+        if !device_agrees_with_cpu(v.id(), *v, &scope, start..start + 32) {
+            return;
         }
     }
 }

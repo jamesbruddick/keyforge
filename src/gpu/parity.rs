@@ -452,47 +452,152 @@ mod tests {
         }
     }
 
-    /// `low-int`'s expansion against the host's, which is the whole of that plugin's
-    /// device half.
+    // ------------------------------------------------------------ vuln_expand
+    //
+    // Every plugin's own kernel, against the `expand` it mirrors. This is the one layer
+    // where a wrong answer has no symptom on a device: the sweep would derive real, valid
+    // wallets that are simply not the wallets the points name, and report a clean range.
+    // A generator ported nearly-correctly -- glibc without its warm-up, CPython through
+    // `init_genrand` -- fails here and nowhere else.
+
+    /// Run `v`'s device expansion over `points` and diff it against `v.expand`.
     ///
-    /// The one thing this kernel can get wrong is where in the 32-byte key the point
-    /// lands, and a wrong answer there has no symptom on a device: the sweep would derive
-    /// real, valid keys that are simply not the keys the point names, and report a clean
-    /// range. So the cases are the byte and word boundaries the placement turns on, plus
-    /// the top of the space and a point above 2^32 for the carry into `point_hi`.
-    #[test]
-    fn low_int_keys_match_the_cpu() {
-        use crate::vuln::{Point, Vulnerability, weak_key::LowInteger};
+    /// Single-stream plugins only, which every plugin tested through here is. The
+    /// MT19937 family walks two and three streams and is covered by `parity_mt` at the
+    /// generator level instead.
+    fn expansion_matches_the_cpu(v: &'static dyn crate::vuln::Vulnerability, points: &[u128]) {
+        use crate::vuln::Point;
 
-        let Some(mut h) = Harness::open_for(&LowInteger) else { return };
-
-        let mut points: Vec<u128> = vec![
-            1, 2, 3, 255, 256, 257, 65_535, 65_536, 16_777_215, 16_777_216,
-            // The end of the space this actually sweeps, and the two points either side
-            // of the 32-bit edge -- where the host's carry hands the device a `point_hi`.
-            0xffff_fffe, 0xffff_ffff, 0x1_0000_0000, 0x1_0000_0001,
-        ];
-        let mut rng = Rng::new(0x10ADD);
-        while points.len() < 256 {
-            points.push(rng.next_u64() as u128);
-        }
+        let Some(mut h) = Harness::open_for(v) else { return };
+        assert_eq!(
+            v.kernel().expect("this plugin has a kernel").streams.len(),
+            1,
+            "{} walks more than one stream; this helper only drives the first",
+            v.id()
+        );
 
         let mut input = Vec::with_capacity(points.len() * 12);
-        for p in &points {
+        for p in points {
             input.extend_from_slice(&(*p as u32).to_le_bytes());
             input.extend_from_slice(&((*p >> 32) as u32).to_le_bytes());
-            input.extend_from_slice(&0u32.to_le_bytes()); // the one stream
+            input.extend_from_slice(&0u32.to_le_bytes());
         }
         let out = h
             .run("parity_expand", points.len(), &input, points.len() * 32)
             .expect("dispatch");
 
+        let mut want = Vec::new();
         for (i, p) in points.iter().enumerate() {
-            let mut want = Vec::new();
-            LowInteger.expand(Point::Integer(*p), &mut want);
-            assert_eq!(want.len(), 1, "low-int expands to one material per point");
-            assert_eq!(out[i * 32..(i + 1) * 32], want[0], "point {p}");
+            want.clear();
+            v.expand(Point::Integer(*p), &mut want);
+            assert_eq!(want.len(), 1, "{} expanded {p} to {} materials", v.id(), want.len());
+            assert_eq!(
+                hex::encode(&out[i * 32..(i + 1) * 32]),
+                hex::encode(want[0]),
+                "{} disagrees at point {p}",
+                v.id()
+            );
         }
+    }
+
+    /// A deterministic tail of random points below `bound`, after the named ones.
+    fn with_random_points(named: &[u128], bound: u128, seed: u64) -> Vec<u128> {
+        let mut rng = Rng::new(seed);
+        let mut points = named.to_vec();
+        while points.len() < 256 {
+            points.push(rng.next_u64() as u128 % bound);
+        }
+        points
+    }
+
+    /// `low-int`, whose kernel is only a placement: the point has to land in the same
+    /// bytes of the key the host puts it in.
+    ///
+    /// The cases are the byte and word boundaries that placement turns on, the top of the
+    /// space, and points either side of 2^32 for the carry into `point_hi`.
+    #[test]
+    fn low_int_keys_match_the_cpu() {
+        let named = [
+            1u128, 2, 3, 255, 256, 257, 65_535, 65_536, 16_777_215, 16_777_216,
+            0xffff_fffe, 0xffff_ffff, 0x1_0000_0000, 0x1_0000_0001,
+        ];
+        expansion_matches_the_cpu(
+            &crate::vuln::weak_key::LowInteger,
+            &with_random_points(&named, 1 << 32, 0x10ADD),
+        );
+    }
+
+    /// `repeated-byte`. The whole space, since it is 255 points.
+    #[test]
+    fn repeated_byte_keys_match_the_cpu() {
+        let points: Vec<u128> = (1..=255u128).collect();
+        expansion_matches_the_cpu(&crate::vuln::weak_key::RepeatedByte, &points);
+    }
+
+    /// `truncated-entropy`, where the kernel takes the prefix width as a `#define`. A
+    /// kernel that disagreed with the host about how many bytes are random would scan a
+    /// different space, so the cases include points that fill the prefix exactly and
+    /// points that do not.
+    #[test]
+    fn truncated_entropy_matches_the_cpu() {
+        let named = [0u128, 1, 255, 256, 65_535, 65_536, 0xdead_beef, 0xffff_ffff];
+        expansion_matches_the_cpu(
+            &crate::vuln::truncated::TruncatedEntropy,
+            &with_random_points(&named, 1 << 32, 0x74011C),
+        );
+    }
+
+    /// `python-random`, which is the port most able to look right and be wrong: MT19937
+    /// through `init_by_array` rather than `init_genrand`. The named seeds are the ones
+    /// the host module pins against a real interpreter's output, so a failure here is
+    /// immediately localisable to the device seeding.
+    #[test]
+    fn python_random_matches_the_cpu() {
+        let named = [0u128, 1, 500, 4_294_967_295];
+        expansion_matches_the_cpu(
+            &crate::vuln::python::PythonRandom,
+            &with_random_points(&named, 1 << 32, 0x9C0DE),
+        );
+    }
+
+    /// `glibc-rand`. Two things this has to get right that nothing else does: the 310
+    /// discarded outputs, and the *signed* Schrage reduction in the seeding.
+    ///
+    /// So the seeds deliberately straddle the sign boundary. A port that seeds in
+    /// unsigned arithmetic agrees for every seed below 2^31 and diverges above it, which
+    /// would leave half the range silently unscanned.
+    #[test]
+    fn glibc_rand_matches_the_cpu() {
+        let named = [
+            1u128, 2, 500, 0x7fff_fffe, 0x7fff_ffff,
+            // The first seeds whose state word reads back negative.
+            0x8000_0000, 0x8000_0001, 0xdead_beef, 0xffff_ffff,
+        ];
+        expansion_matches_the_cpu(
+            &crate::vuln::glibc::GlibcRand,
+            &with_random_points(&named, 1 << 32, 0x91BC),
+        );
+    }
+
+    /// `java-random`, the one plugin whose kernel genuinely needs both halves of the
+    /// point: the space is 2^48 and a millisecond window in 2015 is already past 2^32.
+    ///
+    /// The named seeds are the module's own published vectors plus the bounds of the
+    /// guide's example command, which is the range a user actually scans.
+    #[test]
+    fn java_random_matches_the_cpu() {
+        let named = [
+            0u128, 1, 500, 1_234_567_890, 4_294_967_295,
+            0x1_0000_0000, 0x1_0000_0001,
+            // The whole of 2015, in milliseconds -- the guide's example range.
+            1_420_070_400_000, 1_451_606_399_999, 1_451_606_400_000,
+            // The top of the 48-bit space.
+            (1u128 << 48) - 1,
+        ];
+        expansion_matches_the_cpu(
+            &crate::vuln::java::JavaUtilRandom,
+            &with_random_points(&named, 1 << 48, 0x1A7A),
+        );
     }
 
     /// The mnemonic, byte for byte against `bip39::write_mnemonic`, at all three entropy

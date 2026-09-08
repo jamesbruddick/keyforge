@@ -14,10 +14,10 @@ use crate::scan::derive::Route;
 use crate::vuln::{Defaults, Expanded, Guide, KernelSpec, Point, Space, Vulnerability};
 
 /// The device half of [`LowInteger::expand`].
-///
-/// Only `low-int` gets one. `repeated-byte` is 255 keys, which a device would spend
-/// longer opening than the CPU spends finishing.
 const LOW_INT_KERNEL: &str = include_str!("../../kernels/vuln/low_int.h");
+
+/// The device half of [`RepeatedByte::expand`].
+const REPEATED_BYTE_KERNEL: &str = include_str!("../../kernels/vuln/repeated_byte.h");
 
 /// Private keys that are just small numbers: `1`, `2`, `3`, ...
 ///
@@ -153,6 +153,17 @@ impl Vulnerability for RepeatedByte {
             return;
         };
         out.push([n as u8; 32]);
+    }
+
+    /// One stream. The whole space is 255 points, so this kernel buys nothing on the
+    /// clock -- a device spends longer opening than the CPU spends finishing. It exists
+    /// so that `--gpu` over a list of vulnerabilities does not stop at this one.
+    fn kernel(&self) -> Option<KernelSpec> {
+        Some(KernelSpec {
+            source: REPEATED_BYTE_KERNEL,
+            streams: vec![0],
+            defines: Vec::new(),
+        })
     }
 }
 

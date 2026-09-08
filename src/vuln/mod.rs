@@ -325,6 +325,45 @@ mod tests {
         }
     }
 
+    /// Every integer-space vulnerability ships a GPU kernel, and its stream list matches
+    /// what `expand` actually produces.
+    ///
+    /// The second half is the one that matters. `streams` is how a device record maps
+    /// back to the material the host re-derives, so a plugin claiming two streams while
+    /// expanding to one wallet would have every record confirm against the wrong
+    /// material -- and the only symptom is the `unconfirmed` counter, on a sweep that has
+    /// already run.
+    ///
+    /// `brainwallet` is the deliberate exception: it walks a corpus, and the device
+    /// interface takes a point rather than a phrase. See the GPU section of the README.
+    #[test]
+    fn every_integer_space_vulnerability_has_a_kernel() {
+        for v in registry() {
+            let Space::Integers { start, .. } = v.space() else {
+                assert!(
+                    v.kernel().is_none(),
+                    "{} walks a corpus but claims a kernel; `vuln_expand` cannot be \
+                     handed a phrase",
+                    v.id()
+                );
+                continue;
+            };
+            let spec = v.kernel().unwrap_or_else(|| panic!("{} has no GPU kernel", v.id()));
+            assert!(spec.source.contains("vuln_expand"), "{} defines no vuln_expand", v.id());
+
+            let mut out = Vec::new();
+            v.expand(Point::Integer(start), &mut out);
+            assert_eq!(
+                spec.streams.len(),
+                out.len(),
+                "{} claims {} streams but expands to {} materials",
+                v.id(),
+                spec.streams.len(),
+                out.len()
+            );
+        }
+    }
+
     /// A narrowed scope has to say what it is walking past, so a clean pass over a
     /// preset never reads as a clean pass over the keyspace.
     #[test]

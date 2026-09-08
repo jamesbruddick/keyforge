@@ -26,7 +26,10 @@
 
 use crate::scan::derive::Route;
 use crate::vuln::mt19937::Mt19937;
-use crate::vuln::{Defaults, Expanded, Guide, Point, Space, Vulnerability};
+use crate::vuln::{Defaults, Expanded, Guide, KernelSpec, Point, Space, Vulnerability};
+
+/// The device half of [`PythonRandom::expand`].
+const KERNEL_SOURCE: &str = include_str!("../../kernels/vuln/python.h");
 
 /// A wallet generator seeded with `random.seed(n)` over a 32-bit `n`.
 pub struct PythonRandom;
@@ -93,6 +96,12 @@ impl Vulnerability for PythonRandom {
             chunk.copy_from_slice(&rng.next_u32().to_le_bytes());
         }
         out.push(material);
+    }
+
+    /// One stream: the byte mapping this scans is a documented assumption about the
+    /// script, not a choice between two libraries the way `milksad`'s is.
+    fn kernel(&self) -> Option<KernelSpec> {
+        Some(KernelSpec { source: KERNEL_SOURCE, streams: vec![0], defines: Vec::new() })
     }
 }
 

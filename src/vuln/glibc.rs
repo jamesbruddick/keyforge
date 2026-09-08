@@ -27,7 +27,10 @@
 //! in the tests below possible on a Mac at all.
 
 use crate::scan::derive::Route;
-use crate::vuln::{Defaults, Expanded, Guide, Point, Space, Vulnerability};
+use crate::vuln::{Defaults, Expanded, Guide, KernelSpec, Point, Space, Vulnerability};
+
+/// The device half of [`GlibcRand::expand`].
+const KERNEL_SOURCE: &str = include_str!("../../kernels/vuln/glibc.h");
 
 /// Words of state in the default TYPE_3 generator.
 const DEG: usize = 31;
@@ -170,6 +173,11 @@ impl Vulnerability for GlibcRand {
             *byte = rng.next_byte();
         }
         out.push(material);
+    }
+
+    /// One stream: the low byte of each output, which is the mapping this plugin models.
+    fn kernel(&self) -> Option<KernelSpec> {
+        Some(KernelSpec { source: KERNEL_SOURCE, streams: vec![0], defines: Vec::new() })
     }
 }
 

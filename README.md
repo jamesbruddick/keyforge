@@ -240,6 +240,7 @@ layer is held against an independent oracle rather than against another run of t
 | Private key 1 | The published generator-point addresses |
 | Brainwallet hashes | CPython's `hashlib` |
 | Bloom filter | `keyscan bf-check` against a real filter |
+| Every plugin's kernel | Its own CPU `expand`, on the device, and then a full sweep against the CPU's |
 | **End to end** | **The four Milk Sad canary wallets** — real published (seed, path, address) triples that `bx` itself produced, confirmed on chain |
 
 A few oracles need an external file or binary and skip with a message when it is absent:
@@ -284,9 +285,13 @@ Two things follow from the filter having to be resident:
 * On Apple silicon the filter is bound without copying, so one set of pages serves the GPU
   and every CPU worker at once.
 
-Not every vulnerability has a kernel yet. `keyforge scan --gpu` says so plainly for the
-ones that do not, rather than running slower than you asked; the MT19937 family
-(`milksad`, `trust-wallet`, `php-mt`) all have one, and so does `low-int`.
+Every vulnerability with an integer search space has a kernel. `brainwallet` does not,
+and structurally cannot as things stand: it walks a corpus rather than a range, and the
+device is handed a *point* -- two 32-bit halves -- with no way to receive a passphrase.
+Giving it one means streaming corpus chunks into device memory and changing the shape of
+the entropy kernel, which is a larger piece of work than porting a generator. Until then
+`keyforge scan --vuln brainwallet --gpu` says so plainly rather than running slower than
+you asked.
 
 ## Memory
 

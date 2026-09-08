@@ -1349,22 +1349,27 @@ mod tests {
             }
         }
 
-        // `low-int`'s own scope, which is the degenerate one: no BIP39, no tree, no path,
-        // so several of the constant arrays are empty and several kernels are compiled
-        // out. A kernel set that only ever sees a seed-derived scope does not cover it.
-        let scope = {
+        // Every plugin that ships a kernel, at its own default scope.
+        //
+        // Compiling one is not the same as compiling another: the scope a plugin narrows
+        // to decides which kernels survive the preprocessor, and `low-int` and
+        // `repeated-byte` are the degenerate case -- privkey-only, so there is no BIP39,
+        // no tree and no path, several constant arrays are empty and several kernels are
+        // compiled out entirely. Naming plugins here individually is what would let the
+        // next one be added without ever being built.
+        for v in crate::vuln::registry() {
+            if v.kernel().is_none() {
+                continue;
+            }
             let mut scope = Scope::default();
-            crate::vuln::weak_key::LowInteger.defaults().apply(&mut scope);
-            scope
-        };
-        {
-            match Gpu::open(&scope, &crate::vuln::weak_key::LowInteger, Batch::Fixed(64)) {
-                Ok(gpu) => println!("compiled low-int and smoke-tested on {}", gpu.name()),
+            v.defaults().apply(&mut scope);
+            match Gpu::open(&scope, *v, Batch::Fixed(64)) {
+                Ok(gpu) => println!("compiled {} and smoke-tested on {}", v.id(), gpu.name()),
                 Err(e) if is_unavailable(&e) => {
                     println!("skipping: {e}");
                     return;
                 }
-                Err(e) => panic!("{e}"),
+                Err(e) => panic!("{}: {e}", v.id()),
             }
         }
     }

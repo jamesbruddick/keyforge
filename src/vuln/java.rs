@@ -26,7 +26,10 @@
 //! closed properly by running `agrees_with_a_real_jvm` on a machine that has one.
 
 use crate::scan::derive::Route;
-use crate::vuln::{Defaults, Expanded, Guide, Point, Space, Vulnerability};
+use crate::vuln::{Defaults, Expanded, Guide, KernelSpec, Point, Space, Vulnerability};
+
+/// The device half of [`JavaUtilRandom::expand`].
+const KERNEL_SOURCE: &str = include_str!("../../kernels/vuln/java.h");
 
 const MULTIPLIER: u64 = 0x5DEECE66D;
 const ADDEND: u64 = 0xB;
@@ -146,6 +149,13 @@ impl Vulnerability for JavaUtilRandom {
         let mut material = [0u8; 32];
         rng.next_bytes(&mut material);
         out.push(material);
+    }
+
+    /// One stream. The only plugin whose kernel genuinely needs both halves of the
+    /// point: the seed space is 2^48, and a millisecond window in 2015 is already past
+    /// 2^32.
+    fn kernel(&self) -> Option<KernelSpec> {
+        Some(KernelSpec { source: KERNEL_SOURCE, streams: vec![0], defines: Vec::new() })
     }
 }
 

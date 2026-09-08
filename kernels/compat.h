@@ -125,13 +125,20 @@ INLINE unsigned int mul_hi32(unsigned int a, unsigned int b) { return __umulhi(a
 // Fixed-width names, so the source never says `unsigned long` and means two things.
 typedef unsigned int  u32;
 typedef unsigned char u8;
+// Signed, for the one generator that needs it: glibc's seeding does its Schrage
+// reduction in signed arithmetic and relies on C's truncation toward zero, so porting it
+// to unsigned would diverge for exactly the seeds whose top bit is set. See
+// kernels/vuln/glibc.h.
+typedef int i32;
 #if defined(KEYFORGE_METAL)
+typedef long  i64;
 typedef ulong u64;
 // A 64-bit literal. Metal has no `long long`, so `ull` is not available here; CUDA has no
 // 64-bit `unsigned long` on Windows, so `ul` is not portable there. The suffix is spelled
 // per dialect and everything else says `U64C`.
 #define U64C(x) x##ul
 #else
+typedef long long          i64;
 typedef unsigned long long u64;
 #define U64C(x) x##ull
 #endif

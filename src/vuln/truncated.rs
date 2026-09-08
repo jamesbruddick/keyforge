@@ -21,7 +21,10 @@
 //! zero has to produce a mnemonic anyone can look up.
 
 use crate::scan::derive::Route;
-use crate::vuln::{Defaults, Expanded, Guide, Point, Space, Vulnerability};
+use crate::vuln::{Defaults, Expanded, Guide, KernelSpec, Point, Space, Vulnerability};
+
+/// The device half of [`TruncatedEntropy::expand`].
+const KERNEL_SOURCE: &str = include_str!("../../kernels/vuln/truncated.h");
 
 /// Bytes of real randomness assumed to have reached the buffer.
 ///
@@ -100,6 +103,16 @@ impl Vulnerability for TruncatedEntropy {
         let bytes = (n as u32).to_be_bytes();
         material[..RANDOM_PREFIX].copy_from_slice(&bytes[4 - RANDOM_PREFIX..]);
         out.push(material);
+    }
+
+    /// One stream, and the prefix width goes with it: a kernel that disagreed with the
+    /// host about how many bytes are random would scan a different space entirely.
+    fn kernel(&self) -> Option<KernelSpec> {
+        Some(KernelSpec {
+            source: KERNEL_SOURCE,
+            streams: vec![0],
+            defines: vec![("VULN_RANDOM_PREFIX", format!("{RANDOM_PREFIX}u"))],
+        })
     }
 }
 

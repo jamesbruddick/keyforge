@@ -56,6 +56,39 @@ INLINE void mt_seed(THREAD Mt19937* m, u32 seed, u32 dist) {
     m->php = (dist == MT_PHP) ? 1u : 0u;
 }
 
+// CPython's `random.seed(n)`: `init_by_array` over a one-word key.
+//
+// **This is not `mt_seed` with the same number.** CPython converts the integer to an
+// array of 32-bit words and runs `init_by_array`, which produces a completely unrelated
+// stream from `init_genrand`. Scanning one while meaning the other is the worst failure
+// available here: the sweep finishes, reports clean, and has checked nothing. Mirrors
+// `Mt19937::from_key` in src/vuln/mt19937.rs, which is pinned against values a real
+// interpreter printed.
+//
+// The reference takes a key of any length. A 32-bit seed is one word, so the key index
+// `j` is zero on every iteration -- both the word read and the `+ j` addend -- and the
+// loops below are the general algorithm with that folded in. A wider key would need `j`
+// back; nothing here scans one.
+INLINE void mt_seed_by_array(THREAD Mt19937* m, u32 key) {
+    mt_seed(m, 19650218u, MT_LIBSTDCXX);
+    u32 i = 1;
+    for (u32 k = 0; k < MT_N; k++) {
+        u32 prev = m->state[i - 1];
+        m->state[i] = (m->state[i] ^ (1664525u * (prev ^ (prev >> 30)))) + key;
+        i++;
+        if (i >= MT_N) { m->state[0] = m->state[MT_N - 1]; i = 1; }
+    }
+    for (u32 k = 0; k < MT_N - 1; k++) {
+        u32 prev = m->state[i - 1];
+        m->state[i] = (m->state[i] ^ (1566083941u * (prev ^ (prev >> 30)))) - i;
+        i++;
+        if (i >= MT_N) { m->state[0] = m->state[MT_N - 1]; i = 1; }
+    }
+    // The reference sets the high bit of state[0] so the state is never all-zero.
+    m->state[0] = 0x80000000u;
+    m->index = MT_N;
+}
+
 INLINE void mt_twist(THREAD Mt19937* m) {
     for (u32 i = 0; i < MT_N; i++) {
         u32 u = m->state[i];
