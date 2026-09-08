@@ -131,18 +131,23 @@ impl Layout {
         points * self.leaves_per_point()
     }
 
-    /// The widest intermediate level any spec produces, which is what the level buffers
-    /// have to be sized for.
+    /// The widest *intermediate* level any spec produces, which is what the two level
+    /// buffers have to hold.
     ///
-    /// Levels are walked one spec at a time and the buffers are reused between them, so
-    /// this is a maximum rather than a sum. Taking the sum would allocate several times
-    /// what is needed on a device where memory is the thing that limits the batch.
+    /// Two things make this smaller than it looks. Levels are walked one spec at a time
+    /// and the buffers are reused between them, so this is a maximum rather than a sum.
+    /// And the **last** segment of a spec writes straight into the leaf array rather than
+    /// into a level buffer, so its width does not count here -- which is the widest level
+    /// of all, and including it sized both buffers about ten times too large on the
+    /// default scope. That is memory taken directly out of the batch on the very device
+    /// where memory is what limits it.
     pub fn level_capacity(&self, points: usize) -> usize {
         let trees = self.masters_per_point();
-        let mut widest = trees;
+        let mut widest = 0usize;
         for spec in &self.specs {
             let mut width = 1usize;
-            for seg in spec.segments() {
+            // `len() - 1`: the final segment's output is a leaf, not a level.
+            for seg in spec.segments().iter().take(spec.depth().saturating_sub(1)) {
                 width *= seg.len();
                 widest = widest.max(trees * width);
             }
@@ -282,10 +287,14 @@ mod tests {
     fn level_capacity_is_the_widest_level_not_the_sum() {
         let scope = Scope::default();
         let layout = Layout::new(&scope, 1);
-        // 3 sizes x 2 tree routes x 2 chains x 10 indices is the widest level any of the
-        // default specs reaches.
-        assert_eq!(layout.level_capacity(1), 3 * 2 * 2 * 10);
-        assert!(layout.level_capacity(1) < layout.leaves_per_point() * 4);
+        // The widest intermediate level is the chain level of a BIP44 spec: 3 sizes x
+        // 2 tree routes x 2 chains. The index level below it is four times wider again
+        // and does *not* count, because it writes into the leaf array.
+        assert_eq!(layout.level_capacity(1), 3 * 2 * 2);
+        assert!(
+            layout.level_capacity(1) * 10 < layout.leaves_per_point(),
+            "level buffers are being sized like the leaf level"
+        );
         // And it scales with the launch.
         assert_eq!(layout.level_capacity(8), 8 * layout.level_capacity(1));
     }

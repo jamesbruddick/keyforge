@@ -61,6 +61,11 @@ pub struct ScanConfig {
 /// What a finished or interrupted scan reports back.
 pub struct ScanReport {
     pub points_done: u64,
+    /// Byte streams walked per point. A point costs this many walks of the pipeline, and
+    /// naming it is what stops a rate being compared against one counted per walk.
+    pub streams: usize,
+    /// Where a launch's time went, per kernel, when `KEYFORGE_GPU_PROFILE` is set.
+    pub gpu_profile: Option<String>,
     /// Device records the CPU could not reproduce.
     ///
     /// Should be zero, always. The device is a filter and the CPU is the oracle: a record
@@ -178,6 +183,8 @@ pub fn run(
         ui.notice("nothing to do", "this range has already been walked");
         return Ok(ScanReport {
             points_done: 0,
+            streams: 1,
+            gpu_profile: None,
             unconfirmed: 0,
             total_points,
             candidates: 0,
@@ -424,6 +431,8 @@ pub fn run(
     let sink = sink.lock().unwrap();
     Ok(ScanReport {
         points_done: points_done.load(Ordering::Relaxed),
+        streams: streams_of(vuln, config.start),
+        gpu_profile: device.as_mut().and_then(|g| g.report()),
         unconfirmed: unconfirmed.load(Ordering::Relaxed),
         total_points,
         candidates: sink.candidates,
@@ -431,6 +440,16 @@ pub fn run(
         elapsed: began.elapsed(),
         finished,
     })
+}
+
+/// How many byte streams a vulnerability expands one point to.
+///
+/// Each is a separate walk of the whole pipeline, so a point costs this many. It is asked
+/// once: it is a property of the vulnerability, not of the point.
+pub fn streams_of(vuln: &dyn Vulnerability, at: u128) -> usize {
+    let mut out = Vec::new();
+    vuln.expand(Point::Integer(at), &mut out);
+    out.len().max(1)
 }
 
 /// Open the device and put the filter on it.
@@ -466,6 +485,21 @@ fn open_device(
     if let Some(compiler) = gpu.compiler() {
         ui.row("compiler", &compiler);
     }
+    // The launch size decides whether a device is fed or starved, and it is chosen rather
+    // than given, so it has to be visible. A sweep running at a fraction of the expected
+    // rate is nearly always this number being small.
+    ui.row(
+        "gpu batch",
+        &format!(
+            "{} points{}",
+            ui::commas(gpu.layout().capacity as u64),
+            match config.gpu_batch {
+                Some(_) => "",
+                None => " (auto)",
+            }
+        ),
+    );
+    ui.row("gpu scratch", &ui::bytes(gpu.scratch_bytes() as u64));
     gpu.bind_filter(target.primary())?;
     Ok(gpu)
 }
@@ -509,11 +543,7 @@ fn run_device<'a>(
     block: u64,
     total_blocks: u64,
 ) -> Result<()> {
-    let streams = {
-        let mut out = Vec::new();
-        vuln.expand(Point::Integer(config.start), &mut out);
-        out.len().max(1)
-    };
+    let streams = streams_of(vuln, config.start);
     let capacity = gpu.layout().capacity;
 
     // How many blocks it takes to fill a launch.
@@ -526,12 +556,18 @@ fn run_device<'a>(
     // claims a contiguous *run* of blocks and launches across it.
     let blocks_per_claim = (capacity as u64).div_ceil(block).max(1);
 
-    // Two in flight: one being confirmed while the next is being launched. More would only
-    // buy memory.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Claim>(2);
-    let rx = Mutex::new(rx);
+    // Two claims in flight per confirmer.
+    //
+    // Depth is backpressure: too shallow and the launch loop blocks on `send` while a
+    // confirmer is still walking the last claim, which idles the device for exactly as
+    // long as a CPU re-derivation takes. Too deep and a queued claim is work already
+    // walked but not yet complete, which is what a resumed run repeats. Two per worker
+    // keeps them fed across a launch without letting the watermark lag far behind. A flat
+    // depth of two -- which this had -- starves a device with four confirmers behind it.
     let workers = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) / 4)
         .clamp(1, 4);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Claim>(workers * 2);
+    let rx = Mutex::new(rx);
 
     std::thread::scope(|s| -> Result<()> {
         for _ in 0..workers {
@@ -963,6 +999,8 @@ pub fn run_corpus(
     let points_done = points_done.load(Ordering::Relaxed);
     Ok(ScanReport {
         points_done,
+        streams: 1,
+        gpu_profile: None,
         unconfirmed: 0,
         total_points: points_done as u128,
         candidates: sink.candidates,

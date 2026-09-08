@@ -334,6 +334,16 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
             ui::commas(scope.pbkdf2_per_point())
         ),
     );
+    // Named because it multiplies the work per point, and because a rate counted per
+    // point and one counted per walk differ by exactly this factor -- which is an easy
+    // way to think a sweep is slower than it is.
+    let streams = keyforge::scan::engine::streams_of(v, start);
+    if streams > 1 {
+        ui.row(
+            "streams",
+            &format!("{streams} (each point is walked once per stream)"),
+        );
+    }
     ui.row("threads", &threads.to_string());
     ui.row("output", &args.out.display().to_string());
     ui.gap();
@@ -379,11 +389,17 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
     ui.row_strong(
         if report.finished { "finished" } else { "stopped" },
         &format!(
-            "{} {} in {} ({:.0}/s)",
+            "{} {} in {} ({:.0}/s{})",
             ui::commas(report.points_done),
             if corpus { "passphrases" } else { "points" },
             ui::duration(report.elapsed.as_secs_f64()),
-            rate
+            rate,
+            // Both numbers, when they differ. A point is the unit of coverage; a walk is
+            // the unit of work, and it is the one a per-draw counter reports.
+            match report.streams {
+                1 => String::new(),
+                n => format!(", {:.0} walks/s", rate * n as f64),
+            }
         ),
     );
     ui.row(
@@ -397,6 +413,12 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
     // Should always be zero. See `ScanReport::unconfirmed`: the device is a filter and
     // the CPU is the oracle, so this counts records the two disagree about -- which is the
     // only symptom a silently-wrong kernel has.
+    if let Some(profile) = &report.gpu_profile {
+        ui.gap();
+        for line in profile.lines() {
+            ui.cont_plain(line);
+        }
+    }
     if report.unconfirmed > 0 {
         ui.warn(&format!(
             "{} device records could not be reproduced on the CPU. The two \

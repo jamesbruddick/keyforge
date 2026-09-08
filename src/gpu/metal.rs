@@ -44,7 +44,7 @@ pub struct Metal {
     /// launch loop asks for the same handful thousands of times.
     pipelines: HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     buffers: Vec<Buffer>,
-    /// Wall time and call count per kernel, kept only when MILKSAD_GPU_PROFILE is set.
+    /// Wall time and call count per kernel, kept only when KEYFORGE_GPU_PROFILE is set.
     ///
     /// Every dispatch already waits for its own completion, so this is just a clock around
     /// the wait -- accurate, and free when the variable is unset. It exists because
@@ -68,7 +68,7 @@ impl Metal {
             library: None,
             pipelines: HashMap::new(),
             buffers: Vec::new(),
-            profile: std::env::var_os("MILKSAD_GPU_PROFILE").map(|_| HashMap::new()),
+            profile: std::env::var_os("KEYFORGE_GPU_PROFILE").map(|_| HashMap::new()),
         })
     }
 

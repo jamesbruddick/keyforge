@@ -57,7 +57,7 @@ mod nvrtc;
 /// then applied flat to all fourteen dispatches, which do not have remotely the same
 /// register footprint: `ec_mul_gen` carries a Jacobian accumulator, a table point and nine
 /// live field temporaries inside `gej_add_ge`, where `k_entropy` carries almost nothing.
-/// `MILKSAD_CUDA_BLOCK` overrides it -- see `Tuning`.
+/// `KEYFORGE_CUDA_BLOCK` overrides it -- see `Tuning`.
 const BLOCK: u32 = 256;
 
 /// Compile- and launch-time knobs, read from the environment once.
@@ -68,20 +68,20 @@ const BLOCK: u32 = 256;
 /// rebuilds:
 ///
 /// ```text
-///   MILKSAD_CUDA_BLOCK       threads per block, default 256
-///   MILKSAD_CUDA_MAXREG      --maxrregcount=N, unset by default
-///   MILKSAD_KERNEL_DEFINES   extra NVRTC tokens, space separated
+///   KEYFORGE_CUDA_BLOCK       threads per block, default 256
+///   KEYFORGE_CUDA_MAXREG      --maxrregcount=N, unset by default
+///   KEYFORGE_KERNEL_DEFINES   extra NVRTC tokens, space separated
 /// ```
 ///
 /// ```sh
 /// for r in 0 64 96 128 160; do
-///     MILKSAD_CUDA_MAXREG=$r ./target/release/milksad-scan bench \
+///     KEYFORGE_CUDA_MAXREG=$r ./target/release/milksad-scan bench \
 ///         -f addresses.bf --gpu only --seeds 3000000
 /// done
 /// ```
 ///
 /// Anything that changes what NVRTC produces is part of the PTX cache key, so switching a
-/// knob cannot hand back the previous build -- see `compile_cached`. `MILKSAD_CUDA_BLOCK`
+/// knob cannot hand back the previous build -- see `compile_cached`. `KEYFORGE_CUDA_BLOCK`
 /// is not, because it changes the launch and not the translation unit.
 ///
 /// A bad value is a panic rather than a fallback. Silently measuring the default while the
@@ -92,7 +92,7 @@ const BLOCK: u32 = 256;
 /// `__launch_bounds__` in the kernel, with the table that chose it. The variable is for
 /// finding the answer, not for holding it.
 ///
-/// **`MILKSAD_CUDA_MAXREG` has now been swept on an RTX 5070 Ti, and the answer is that
+/// **`KEYFORGE_CUDA_MAXREG` has now been swept on an RTX 5070 Ti, and the answer is that
 /// occupancy is not the constraint.** Default scope, 3,000,000 seeds against the real
 /// filter, medians of three:
 ///
@@ -171,7 +171,7 @@ struct Tuning {
 
 /// Threads per block and register cap for a compute capability, before the environment gets
 /// a say. See the table above: `0` is "no cap", which is what an uncapped allocator is
-/// spelled as in `MILKSAD_CUDA_MAXREG` too.
+/// spelled as in `KEYFORGE_CUDA_MAXREG` too.
 const fn defaults_for(major: i32) -> (u32, u32) {
     match major {
         ..=6 => (128, 128),
@@ -188,14 +188,14 @@ impl Tuning {
     fn for_capability(major: i32) -> Self {
         let (default_block, default_maxreg) = defaults_for(major);
 
-        let block = match std::env::var("MILKSAD_CUDA_BLOCK") {
+        let block = match std::env::var("KEYFORGE_CUDA_BLOCK") {
             Ok(v) => {
                 let n: u32 = v.trim().parse().unwrap_or_else(|_| {
-                    panic!("MILKSAD_CUDA_BLOCK must be a number, got `{v}`")
+                    panic!("KEYFORGE_CUDA_BLOCK must be a number, got `{v}`")
                 });
                 assert!(
                     n > 0 && n <= 1024 && n % 32 == 0,
-                    "MILKSAD_CUDA_BLOCK must be a multiple of 32 between 32 and 1024, got {n}"
+                    "KEYFORGE_CUDA_BLOCK must be a multiple of 32 between 32 and 1024, got {n}"
                 );
                 n
             }
@@ -205,15 +205,15 @@ impl Tuning {
         // Trading registers for occupancy. `0` means "no cap", so a sweep can include the
         // unset case without special-casing the loop in the shell -- and so an operator on
         // a Pascal card can ask for the uncapped allocator back the same way.
-        let maxreg = match std::env::var("MILKSAD_CUDA_MAXREG") {
+        let maxreg = match std::env::var("KEYFORGE_CUDA_MAXREG") {
             Ok(v) => {
                 let n: u32 = v
                     .trim()
                     .parse()
-                    .unwrap_or_else(|_| panic!("MILKSAD_CUDA_MAXREG must be a number, got `{v}`"));
+                    .unwrap_or_else(|_| panic!("KEYFORGE_CUDA_MAXREG must be a number, got `{v}`"));
                 assert!(
                     n == 0 || (16..=255).contains(&n),
-                    "MILKSAD_CUDA_MAXREG must be 0 (no cap) or between 16 and 255, got {n}"
+                    "KEYFORGE_CUDA_MAXREG must be 0 (no cap) or between 16 and 255, got {n}"
                 );
                 n
             }
@@ -230,8 +230,8 @@ impl Tuning {
         }
 
         // The general escape hatch, so an A/B inside the kernels is a `-D` rather than an
-        // edit. `MILKSAD_PORTABLE_ROTR64` in kernels/sha512.h is the one this was added for.
-        if let Ok(extra) = std::env::var("MILKSAD_KERNEL_DEFINES") {
+        // edit. `KEYFORGE_PORTABLE_ROTR64` in kernels/sha512.h is the one this was added for.
+        if let Ok(extra) = std::env::var("KEYFORGE_KERNEL_DEFINES") {
             options.extend(extra.split_whitespace().map(str::to_string));
         }
 
@@ -277,7 +277,7 @@ pub struct Cuda {
     /// thousands of times.
     functions: HashMap<String, CudaFunction>,
     buffers: Vec<CudaSlice<u8>>,
-    /// Wall time and call count per kernel, kept only when MILKSAD_GPU_PROFILE is set.
+    /// Wall time and call count per kernel, kept only when KEYFORGE_GPU_PROFILE is set.
     ///
     /// **This did not exist, and its absence is why every figure in the README's kernel
     /// tables was taken on an M1 Pro.** The Metal backend has had one from the start; the
@@ -535,7 +535,7 @@ impl Cuda {
             module: None,
             functions: HashMap::new(),
             buffers: Vec::new(),
-            profile: std::env::var_os("MILKSAD_GPU_PROFILE").map(|_| HashMap::new()),
+            profile: std::env::var_os("KEYFORGE_GPU_PROFILE").map(|_| HashMap::new()),
         })
     }
 
@@ -753,7 +753,7 @@ impl Backend for Cuda {
     /// been optimising each kernel for one thread's latency with no view of how many
     /// threads that leaves resident. `local` is the tell for having pushed too hard the
     /// other way: it is bytes spilled per thread, and anything above zero on `k_kmul` or
-    /// `k_pbkdf2` means a `MILKSAD_CUDA_MAXREG` sweep has gone past the knee.
+    /// `k_pbkdf2` means a `KEYFORGE_CUDA_MAXREG` sweep has gone past the knee.
     fn report(&mut self) -> Option<String> {
         let profile = self.profile.as_ref()?;
         let mut rows: Vec<_> = profile.iter().collect();
@@ -864,8 +864,8 @@ mod tests {
     #[test]
     fn the_banner_names_a_card_that_was_tuned_differently() {
         // Environment overrides would make this a test of the machine it runs on.
-        if std::env::var_os("MILKSAD_CUDA_BLOCK").is_some()
-            || std::env::var_os("MILKSAD_CUDA_MAXREG").is_some()
+        if std::env::var_os("KEYFORGE_CUDA_BLOCK").is_some()
+            || std::env::var_os("KEYFORGE_CUDA_MAXREG").is_some()
         {
             return;
         }

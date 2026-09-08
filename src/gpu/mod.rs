@@ -475,7 +475,7 @@ const WINDOW_REFERENCE_BATCH: usize = 16_384;
 ///   * **A device that will not report its memory**, which is assumed small rather than
 ///     guessed at, exactly as `auto_batch` does.
 ///
-/// `MILKSAD_GPU_WINDOW` overrides all of it. Pure arithmetic on purpose, like `auto_batch`:
+/// `KEYFORGE_GPU_WINDOW` overrides all of it. Pure arithmetic on purpose, like `auto_batch`:
 /// it is the piece most worth being able to check without a GPU.
 pub fn auto_window(
     l: &Layout,
@@ -492,7 +492,7 @@ pub fn auto_window(
     // policy one: `Batch::Fixed` carries no filter size, so there is nothing to subtract
     // from the card before spending gigabytes on a table. Widening on a guess of zero would
     // pick the widest rung there is and then fail to place the filter beside it.
-    // `--gpu-batch` is a manual override; `MILKSAD_GPU_WINDOW` is the matching one here.
+    // `--gpu-batch` is a manual override; `KEYFORGE_GPU_WINDOW` is the matching one here.
     let Batch::Auto { filter_bytes, .. } = batch else {
         return default;
     };
@@ -1178,7 +1178,7 @@ impl Gpu {
     }
 }
 
-/// Print a timestamped stage to stderr when MILKSAD_GPU_TRACE is set.
+/// Print a timestamped stage to stderr when KEYFORGE_GPU_TRACE is set.
 ///
 /// Opening a device is four steps -- find the libraries, assemble the source, compile it,
 /// run a smoke dispatch -- and when one of them does not return, which one matters more
@@ -1189,7 +1189,7 @@ pub fn trace(stage: &str) {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     static START: OnceLock<std::time::Instant> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("MILKSAD_GPU_TRACE").is_some()) {
+    if !*ON.get_or_init(|| std::env::var_os("KEYFORGE_GPU_TRACE").is_some()) {
         return;
     }
     let start = START.get_or_init(std::time::Instant::now);
