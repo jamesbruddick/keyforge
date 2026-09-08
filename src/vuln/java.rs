@@ -85,13 +85,16 @@ impl Vulnerability for JavaUtilRandom {
     fn id(&self) -> &'static str {
         "java-random"
     }
+
+    fn classification(&self) -> &'static str {
+        "no CVE -- a generator class, not a product"
+    }
     fn aliases(&self) -> &'static [&'static str] {
         &["java"]
     }
 
     fn describe(&self) -> Vec<String> {
         vec![
-            "java-random (no CVE -- a generator class, not a product)".into(),
             "java.util.Random, a 48-bit LCG, usually seeded from \
              System.currentTimeMillis(). The full 2^48 space is NOT feasible to sweep: \
              narrow --start and --end to the window the wallet was created in, which is \

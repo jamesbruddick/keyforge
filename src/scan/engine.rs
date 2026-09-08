@@ -481,36 +481,38 @@ fn open_device(
         },
     };
     let mut gpu = Gpu::open(scope, vuln, batch)?;
-    ui.row("device", &gpu.name());
-    // Which of the two the sweep is actually in. `--gpu` and `--gpu only` differ by
-    // whether the CPU walks points of its own, which is most of the difference in the
-    // rate the bar goes on to report -- and `--gpu` alone defaulting to `both` is the
-    // kind of thing worth confirming in the banner rather than in the documentation.
+    // The device block, as one row and its detail rather than five equal rows. What the
+    // card is, and whether the CPU is walking points beside it, is the part read at a
+    // glance; the compiler and the launch geometry are what a slow sweep is diagnosed
+    // from, and they belong under it rather than beside it.
     ui.row(
-        "mode",
-        match config.gpu {
-            Some(crate::gpu::Mode::Only) => "device only; the CPU confirms what it finds",
-            _ => "device and CPU together",
-        },
+        "device",
+        &format!(
+            "{}, {}",
+            gpu.name(),
+            match config.gpu {
+                // `--gpu` alone defaults to `both`, which is worth confirming here rather
+                // than leaving to the documentation.
+                Some(crate::gpu::Mode::Only) => "with the CPU confirming what it finds",
+                _ => "with the CPU walking points alongside",
+            }
+        ),
     );
     if let Some(compiler) = gpu.compiler() {
-        ui.row("compiler", &compiler);
+        ui.cont(&compiler);
     }
     // The launch size decides whether a device is fed or starved, and it is chosen rather
     // than given, so it has to be visible. A sweep running at a fraction of the expected
     // rate is nearly always this number being small.
-    ui.row(
-        "gpu batch",
-        &format!(
-            "{} points{}",
-            ui::commas(gpu.layout().capacity as u64),
-            match config.gpu_batch {
-                Some(_) => "",
-                None => " (auto)",
-            }
-        ),
-    );
-    ui.row("gpu scratch", &ui::bytes(gpu.scratch_bytes() as u64));
+    ui.cont(&format!(
+        "{} points per launch{}, {} scratch",
+        ui::commas(gpu.layout().capacity as u64),
+        match config.gpu_batch {
+            Some(_) => "",
+            None => " (auto)",
+        },
+        ui::bytes(gpu.scratch_bytes() as u64),
+    ));
     gpu.bind_filter(target.primary())?;
     Ok(gpu)
 }

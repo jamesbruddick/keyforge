@@ -138,16 +138,27 @@ impl<'a> MatchSink<'a> {
         // same point, and a line that reads as a continuation of something no longer
         // above it is worse than a repeated word.
         let headline = format!(
-            "{} {} · {}B · {} · {} · {} · {}  {}",
+            "{} {} · {}B · {} · {} · {}",
             hit.vuln,
             hit.point,
             hit.location.material_len,
             hit.location.route.as_str(),
             hit.location.path(scope).unwrap_or_else(|| "(raw key)".into()),
             hit.location.form.as_str(),
-            self.ui.data(&address::encode(hit.location.form, hit.hash)),
-            self.ui.dim(&ui::hex(hit.hash))
         );
+        // The addresses on their own lines under it. A compressed hash160 is spendable
+        // two ways and `encode` returns both, which together with the headline and the
+        // hash160 made a single line of over 160 characters -- on the one announcement of
+        // a sweep that has to be readable. Split here rather than wrapped, because each
+        // of these is a string someone is about to paste into a block explorer and a
+        // wrapped address cannot be selected in one go.
+        let mut context: Vec<String> = address::encode(hit.location.form, hit.hash)
+            .split(" / ")
+            .map(|address| self.ui.data(address))
+            .collect();
+        // Last, and dim: it is what the filter was actually asked about, so it is the
+        // line that matters when a hit is being argued with, and noise otherwise.
+        context.push(self.ui.dim(&format!("hash160 {}", ui::hex(hit.hash))));
 
         if let Some(details) = &mut self.details {
             let _ = writeln!(details, "{}", details_line(hit, scope, &secret));
@@ -164,15 +175,20 @@ impl<'a> MatchSink<'a> {
                 Route::Bip39 => "same phrase",
                 _ => "same key",
             };
-            self.ui.announce(repeat, &headline, &[]);
+            self.ui.announce(repeat, &headline, &context);
             return;
         }
 
         self.candidates += 1;
-        // The secret gets the second line to itself: it is the whole output of the
-        // sweep, it is what the triage tools want pasted into them, and at 24 words it
-        // would push everything else off the edge if it shared a line.
-        self.ui.announce("candidate", &headline, &[self.ui.data(&secret)]);
+        // The secret gets the lines under the headline to itself: it is the whole output
+        // of the sweep, it is what the triage tools want pasted into them, and at 24
+        // words it would push everything else off the edge if it shared a line. Laid out
+        // in rows of six rather than run out flat, because at 24 words it ran off the
+        // side of the terminal too -- see `ui::phrase_lines`. The file still gets the one
+        // flat line; this is only what the reader sees.
+        let mut body = context;
+        body.extend(ui::phrase_lines(&secret).iter().map(|row| self.ui.data(row)));
+        self.ui.announce("candidate", &headline, &body);
         // Matches are rare enough that syncing on each one is free, and it means a crash
         // or a power cut never costs a candidate.
         let _ = writeln!(self.file, "{secret}");

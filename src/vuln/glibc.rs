@@ -101,13 +101,16 @@ impl Vulnerability for GlibcRand {
     fn id(&self) -> &'static str {
         "glibc-rand"
     }
+
+    fn classification(&self) -> &'static str {
+        "no CVE -- a generator class, not a product"
+    }
     fn aliases(&self) -> &'static [&'static str] {
         &["glibc", "srandom"]
     }
 
     fn describe(&self) -> Vec<String> {
         vec![
-            "glibc-rand (no CVE -- a generator class, not a product)".into(),
             "C's random()/rand() on glibc, a TYPE_3 additive-feedback generator seeded \
              with srandom(). Typically seeded from time(NULL), so if you know roughly \
              when the wallet was made the range narrows to those seconds. The byte \

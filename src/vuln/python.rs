@@ -38,13 +38,16 @@ impl Vulnerability for PythonRandom {
     fn id(&self) -> &'static str {
         "python-random"
     }
+
+    fn classification(&self) -> &'static str {
+        "no CVE -- a generator class, not a product"
+    }
     fn aliases(&self) -> &'static [&'static str] {
         &["python", "cpython"]
     }
 
     fn describe(&self) -> Vec<String> {
         vec![
-            "python-random (no CVE -- a generator class, not a product)".into(),
             "CPython random.seed(n) over a 32-bit n: MT19937 seeded through init_by_array, \
              which is a different stream from std::mt19937 with the same number. The byte \
              mapping scanned is successive getrandbits(32) words, little-endian, which is \

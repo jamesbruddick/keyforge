@@ -404,10 +404,15 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
     }
 
     ui.title(env!("CARGO_PKG_VERSION"));
+    ui.gap();
+
+    // The vulnerability, as a heading: what it is called and how it is classified, then
+    // its own prose under it. One block, so the reader knows what is being looked for
+    // before being shown how.
+    ui.row(v.id(), v.classification());
     for line in v.describe() {
         ui.cont_plain(&line);
     }
-    ui.gap();
 
     // Narrowing a range is only sound for a vulnerability whose points have structure a
     // user can reason about. Everywhere else it leaves a hole, and saying so is the
@@ -423,53 +428,70 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
 
     let target = load_filter(ui, &args.filter, &scope)?;
 
-    // Any warning raised above -- a narrowed range with no time structure, a filter that
-    // cannot match a form being derived -- sits between the description and the scope
-    // table. Without this it reads as the first two rows of that table. Collapses to
-    // nothing when there were no warnings, which is the usual case.
+    // What is being walked. The range and its size share a row because neither is much
+    // use without the other, and the per-point costs go underneath because they are what
+    // turns a point count into a running time.
     ui.gap();
-    ui.row("vulnerability", v.id());
-    if let Some(cve) = v.cve() {
-        ui.row("cve", cve);
-    }
     match &args.corpus {
-        Some(path) => ui.row("corpus", &path.display().to_string()),
+        Some(path) => ui.row("search", &path.display().to_string()),
         None => ui.row(
-            "range",
-            &format!("{start} .. {end}  ({} points)", ui::commas_u128(end - start)),
+            "search",
+            // The bounds first and unpunctuated, because they are the two numbers a
+            // reader retypes into --start and --end; the count beside them is the one
+            // they are reading for. Grouping the bounds with commas would make them
+            // readable and unpasteable at the same time.
+            &format!(
+                "{start} .. {end}  ·  {}",
+                plural_u128(end - start, "point")
+            ),
         ),
     }
+    // Named because it multiplies the work per point, and because a rate counted per
+    // point and one counted per walk differ by exactly this factor -- which is an easy
+    // way to think a sweep is slower than it is.
+    let streams = keyforge::scan::engine::streams_of(v, start);
+    ui.cont(&format!(
+        "{}per point: {}, {}, {}",
+        match streams {
+            1 => String::new(),
+            n => format!("{n} streams, each walked in full · "),
+        },
+        plural(scope.probes_per_point(), "probe"),
+        plural(scope.ec_ops_per_point(), "key"),
+        // Not pluralised: `pbkdf2s` is not a word anyone writes.
+        format!("{} pbkdf2", ui::commas(scope.pbkdf2_per_point())),
+    ));
     ui.row("material", &fmt(&scope.material_sizes, |s| format!("{s}B")));
     ui.row("routes", &fmt(&scope.routes, |r| r.as_str().to_string()));
     // Only shown when something actually walks them. A privkey-only scope carries the
     // default path set and never touches it, and listing paths a scan does not walk
     // invites exactly the wrong conclusion about what a clean pass covered.
+    let forms = fmt(&scope.forms, |f| f.as_str().to_string());
     if scope.routes.iter().any(|r| r.derives()) {
         for (i, path) in scope.paths.iter().enumerate() {
             ui.row(if i == 0 { "paths" } else { "" }, &path.to_string());
         }
+        // The forms are a *cross product* with the paths, not a property of them: every
+        // leaf of every path is hashed every way the scope asks for. Said here, under the
+        // paths, because listing them as their own row reads as a second axis that lines
+        // up with the purposes above -- and the natural conclusion, that m/44' is the
+        // legacy row and m/49' the p2sh one, is not what this derives. It is worth
+        // knowing which way round it is: `--hash-forms` is the flag that cuts the work
+        // when the correspondence does hold for what you are looking for.
+        ui.cont(&format!("each leaf hashed as {forms}"));
+    } else {
+        // Nothing walks a tree, so there is no path for a form to be a product with.
+        ui.row("hash forms", &forms);
     }
-    ui.row("hash forms", &fmt(&scope.forms, |f| f.as_str().to_string()));
-    ui.row(
-        "per point",
-        &format!(
-            "{} · {} · {} pbkdf2",
-            plural(scope.probes_per_point(), "probe"),
-            plural(scope.ec_ops_per_point(), "key"),
-            ui::commas(scope.pbkdf2_per_point())
-        ),
-    );
-    // Named because it multiplies the work per point, and because a rate counted per
-    // point and one counted per walk differ by exactly this factor -- which is an easy
-    // way to think a sweep is slower than it is.
-    let streams = keyforge::scan::engine::streams_of(v, start);
-    if streams > 1 {
-        ui.row(
-            "streams",
-            &format!("{streams} (each point is walked once per stream)"),
-        );
-    }
-    ui.row("threads", &threads.to_string());
+
+    // What it is being walked *against*. This block used to be missing entirely: a sweep
+    // named the vulnerability, the scope and the device, and said nothing at all about
+    // the file that decides every verdict it reaches. A filter that is the wrong size,
+    // covers the wrong forms, or admits strangers at a rate that will bury triage is a
+    // thing to find out here rather than three days in.
+    ui.gap();
+    describe_filter(ui, &target, &args.filter);
+    ui.row("cpu", &plural(threads as u64, "thread"));
     ui.row("output", &args.out.display().to_string());
     ui.gap();
 
@@ -514,9 +536,8 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
     ui.row_strong(
         if report.finished { "finished" } else { "stopped" },
         &format!(
-            "{} {} in {} ({:.0}/s{})",
-            ui::commas(report.points_done),
-            if corpus { "passphrases" } else { "points" },
+            "{} in {} ({:.0}/s{})",
+            plural(report.points_done, if corpus { "passphrase" } else { "point" }),
             ui::duration(report.elapsed.as_secs_f64()),
             rate,
             // Both numbers, when they differ. A point is the unit of coverage; a walk is
@@ -688,7 +709,13 @@ fn run_verify(ui: &Ui, args: VerifyArgs) -> Result<()> {
             }
         };
 
-        ui.row("secret", &ui.data(line.trim()));
+        // Rows of six, so a 24-word phrase is four readable lines rather than one that
+        // runs off the side of the terminal.
+        let rows = ui::phrase_lines(line);
+        ui.row("secret", &ui.data(&rows[0]));
+        for row in &rows[1..] {
+            ui.cont_verbatim(&ui.data(row));
+        }
         ui.row("type", &secret.kind());
 
         // Every hash the scope derives, in walk order, with its path and form. Collected
@@ -831,6 +858,60 @@ fn read_secrets(args: &[String]) -> Result<Vec<(usize, String)>> {
     Ok(out)
 }
 
+/// The target block of the banner: the file every verdict is reached against.
+///
+/// Four facts, in the order they matter. The size is what has to fit in RAM. The forms
+/// are what can match at all -- a filter without P2SH entries answers "no" to a third of
+/// what a default scope derives, whatever the wallets behind them hold. The rate is how
+/// much of `matches.txt` will turn out to be nothing, which is the difference between an
+/// afternoon of triage and a week of it. The companion is what cuts that rate down.
+fn describe_filter(ui: &Ui, target: &Target, path: &std::path::Path) {
+    let primary = target.primary();
+    ui.row(
+        "filter",
+        &format!(
+            "{}, {}",
+            path.display(),
+            ui::bytes(primary.size_bytes() as u64)
+        ),
+    );
+    let forms = keyforge::target::bloom::kind_names(primary.kinds());
+    ui.cont(&format!(
+        "{} layout, covering {}",
+        primary.layout().name(),
+        if forms.is_empty() { "nothing it will say".to_string() } else { forms.join(", ") }
+    ));
+    // Sampled rather than computed from a declared entry count, because the header does
+    // not carry one and a filter holding far fewer entries than it was sized for is
+    // common -- and reads as a much better rate than the file actually delivers.
+    ui.cont(&format!(
+        "false positives: {}",
+        ui::one_in(primary.false_positive_rate(FILL_SAMPLES))
+    ));
+    match target.verify() {
+        Some(companion) => ui.cont(&format!(
+            "{} alongside, ruling most of those out ({} between them)",
+            keyforge::target::verify_path(path).display(),
+            ui::one_in(
+                primary.false_positive_rate(FILL_SAMPLES)
+                    * companion.false_positive_rate(FILL_SAMPLES)
+            )
+        )),
+        None => ui.cont(
+            "no verification filter alongside it, so every false positive reaches \
+             matches.txt for triage to rule out",
+        ),
+    }
+}
+
+/// Words sampled to estimate a filter's fill, and from it its false-positive rate.
+///
+/// The bits are far too many to count -- a 7.6 GB filter is 60 billion of them -- and
+/// they are uniformly distributed by construction, so a stride sample converges quickly.
+/// Ten thousand is far past where the estimate stops moving and still costs nothing
+/// beside the read that just loaded the file.
+const FILL_SAMPLES: usize = 10_000;
+
 /// Total physical RAM, where the platform will say.
 #[cfg(target_os = "linux")]
 fn physical_ram() -> Option<u64> {
@@ -938,6 +1019,13 @@ fn load_filter(ui: &Ui, path: &std::path::Path, scope: &Scope) -> Result<Target>
 /// `1 keys` in the banner of a scan that is otherwise carefully aligned is small, and
 /// exactly the kind of small that makes a tool read as unfinished. The narrow scopes hit
 /// it constantly: `low-int` derives one key per point.
+fn plural_u128(count: u128, unit: &str) -> String {
+    match count {
+        1 => format!("1 {unit}"),
+        n => format!("{} {unit}s", ui::commas_u128(n)),
+    }
+}
+
 fn plural(count: u64, unit: &str) -> String {
     match count {
         1 => format!("1 {unit}"),

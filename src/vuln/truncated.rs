@@ -40,13 +40,16 @@ impl Vulnerability for TruncatedEntropy {
     fn id(&self) -> &'static str {
         "truncated-entropy"
     }
+
+    fn classification(&self) -> &'static str {
+        "no CVE -- a call-site bug, not a generator"
+    }
     fn aliases(&self) -> &'static [&'static str] {
         &["truncated", "short-entropy"]
     }
 
     fn describe(&self) -> Vec<String> {
         vec![
-            "truncated-entropy (no CVE -- a call-site bug, not a generator)".into(),
             format!(
                 "BIP39 entropy with only the first {RANDOM_PREFIX} bytes random and the \
                  rest left zero, which is what an unchecked short read or a wrong loop \

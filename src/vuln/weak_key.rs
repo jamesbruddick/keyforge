@@ -31,13 +31,16 @@ impl Vulnerability for LowInteger {
     fn id(&self) -> &'static str {
         "low-int"
     }
+
+    fn classification(&self) -> &'static str {
+        "no CVE -- a failure mode, not a product"
+    }
     fn aliases(&self) -> &'static [&'static str] {
         &["puzzle", "small-key"]
     }
 
     fn describe(&self) -> Vec<String> {
         vec![
-            "low-int (no CVE -- a failure mode, not a product)".into(),
             "Private keys that are small integers: 1, 2, 3 and upwards. Produced by a \
              generator whose randomness returned zeros, by a buffer holding an index \
              rather than a key, and deliberately by the puzzle addresses. Only the \
@@ -109,9 +112,12 @@ impl Vulnerability for RepeatedByte {
         "repeated-byte"
     }
 
+    fn classification(&self) -> &'static str {
+        "no CVE -- a failure mode, not a product"
+    }
+
     fn describe(&self) -> Vec<String> {
         vec![
-            "repeated-byte (no CVE -- a failure mode, not a product)".into(),
             "Private keys made of one byte repeated 32 times, which is what a memset on \
              the wrong buffer or an uninitialised page leaves behind. Only 255 keys, so \
              it costs nothing to include in any investigation."

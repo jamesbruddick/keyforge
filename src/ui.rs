@@ -659,15 +659,67 @@ pub fn duration(seconds: f64) -> String {
     }
 }
 
+/// A large count in words: `12 million`, `1.2 billion`.
+///
+/// For figures whose magnitude is the whole message and whose digits are noise -- a
+/// filter's false-positive rate is "about one in twelve million", and printing
+/// `12,043,918` invites a precision that a sampled estimate does not have.
+pub fn magnitude(count: f64) -> String {
+    const SCALES: [(f64, &str); 4] = [
+        (1e12, "trillion"),
+        (1e9, "billion"),
+        (1e6, "million"),
+        (1e3, "thousand"),
+    ];
+    if !count.is_finite() || count < 0.0 {
+        return "--".to_string();
+    }
+    for (size, name) in SCALES {
+        if count >= size {
+            let scaled = count / size;
+            // One decimal below ten, none above: `1.2 billion` says something `1 billion`
+            // does not, while `847.3 million` says nothing `847 million` does not.
+            return if scaled < 10.0 {
+                format!("{scaled:.1} {name}")
+            } else {
+                format!("{scaled:.0} {name}")
+            };
+        }
+    }
+    format!("{count:.0}")
+}
+
+/// A probability as the odds a reader can hold in their head.
+///
+/// A bloom filter's false-positive rate arrives as `1.4e-7`, which is exact, unreadable,
+/// and the number that decides how much triage a sweep will generate. `1 in 7 million`
+/// is the same fact in the form the decision is actually made in.
+pub fn one_in(rate: f64) -> String {
+    if !rate.is_finite() || rate <= 0.0 {
+        // A filter with no bits set has no false positives, and neither does a rate that
+        // underflows. Both mean the same thing here and neither is worth a number.
+        return "none measurable".to_string();
+    }
+    if rate >= 1.0 {
+        return "every lookup".to_string();
+    }
+    format!("1 in {}", magnitude(1.0 / rate))
+}
+
 /// A byte count in the unit that keeps it to a small number.
 pub fn bytes(count: u64) -> String {
     const GB: f64 = 1e9;
     const MB: f64 = 1e6;
+    const KB: f64 = 1e3;
     let n = count as f64;
     if n >= GB {
         format!("{:.1} GB", n / GB)
     } else if n >= MB {
         format!("{:.1} MB", n / MB)
+    } else if n >= KB {
+        // A small filter or a short scratch buffer landed here as a bare six-digit byte
+        // count, which is the one size nobody reads at a glance.
+        format!("{:.1} KB", n / KB)
     } else {
         format!("{count} B")
     }
@@ -783,6 +835,49 @@ pub fn wrap(text: &str, width: usize, indent: usize) -> Vec<String> {
         lines.pop();
     }
     lines
+}
+
+/// Words of a mnemonic per line when one is shown on the terminal.
+///
+/// Six, so that every phrase length BIP39 defines divides evenly into whole rows -- 12
+/// is two, 18 is three, 24 is four -- and a reader counting words never has to finish a
+/// row that stops halfway.
+pub const PHRASE_WORDS_PER_LINE: usize = 6;
+
+/// The longest word in the BIP39 English list, which sets the column width.
+const LONGEST_BIP39_WORD: usize = 8;
+
+/// Lay a secret out for reading: a mnemonic in aligned rows of
+/// [`PHRASE_WORDS_PER_LINE`], anything else on one line.
+///
+/// A 24-word phrase is over two hundred characters and ran off the side of the terminal,
+/// which is the one line of a sweep that must be readable. Set in columns rather than
+/// merely broken, because the reason to read a phrase off a screen is to check it word
+/// by word against something else, and ragged rows make that a place-keeping exercise.
+///
+/// This is presentation only. `matches.txt` keeps one secret per line and nothing else,
+/// which is what anything downstream reads -- so a phrase here is never re-joined from
+/// what the terminal shows.
+pub fn phrase_lines(secret: &str) -> Vec<String> {
+    let words: Vec<&str> = secret.split_whitespace().collect();
+    // A private key is one token and a very long one; there is nothing to lay out.
+    if words.len() <= PHRASE_WORDS_PER_LINE {
+        return vec![secret.trim().to_string()];
+    }
+    words
+        .chunks(PHRASE_WORDS_PER_LINE)
+        .map(|row| {
+            row.iter()
+                .map(|word| format!("{word:<LONGEST_BIP39_WORD$}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+                // The last column is padded like the rest and does not need to be; the
+                // trailing run would otherwise be selected along with the words when
+                // someone drags across the line.
+                .trim_end()
+                .to_string()
+        })
+        .collect()
 }
 
 /// Lowercase hex, for hash160s.
@@ -943,6 +1038,35 @@ mod tests {
         assert_eq!(wrap(address, 20, 0), [address]);
     }
 
+    /// A 24-word phrase is over two hundred characters, and it is the one line of a
+    /// sweep that has to be readable. Six to a row divides every BIP39 length evenly.
+    #[test]
+    fn a_mnemonic_is_laid_out_six_words_to_the_row() {
+        let phrase = "abandon abandon abandon abandon abandon abandon \
+                      abandon abandon abandon abandon abandon about";
+        let rows = phrase_lines(&phrase.split_whitespace().collect::<Vec<_>>().join(" "));
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.split_whitespace().count(), 6);
+            assert!(!row.ends_with(' '), "a padded tail gets selected with the words");
+        }
+        // Columns line up, so a word can be checked against another list by position.
+        assert_eq!(rows[0], "abandon  abandon  abandon  abandon  abandon  abandon");
+        assert_eq!(rows[1], "abandon  abandon  abandon  abandon  abandon  about");
+        // And no word is lost or invented on the way through.
+        assert_eq!(rows.join(" ").split_whitespace().count(), 12);
+    }
+
+    /// 18 and 24 words divide the same way; a private key is one token and is left be.
+    #[test]
+    fn other_secret_shapes_survive_the_layout() {
+        let words = |n: usize| vec!["abandon"; n].join(" ");
+        assert_eq!(phrase_lines(&words(18)).len(), 3);
+        assert_eq!(phrase_lines(&words(24)).len(), 4);
+        let key = "0000000000000000000000000000000000000000000000000000000000000001";
+        assert_eq!(phrase_lines(key), [key]);
+    }
+
     #[test]
     fn commas_group_from_the_right() {
         assert_eq!(commas(0), "0");
@@ -978,9 +1102,32 @@ mod tests {
         assert_eq!(duration(-1.0), "--");
     }
 
+    /// A filter's false-positive rate decides how much triage a sweep generates, and it
+    /// arrives as `1.4e-7`. The odds are the form that decision is made in.
+    #[test]
+    fn a_false_positive_rate_reads_as_odds() {
+        assert_eq!(one_in(1e-7), "1 in 10 million");
+        assert_eq!(one_in(1.4e-7), "1 in 7.1 million");
+        assert_eq!(one_in(1e-10), "1 in 10 billion");
+        // An empty filter and an underflowed rate mean the same thing, and neither is
+        // worth a number.
+        assert_eq!(one_in(0.0), "none measurable");
+        assert_eq!(one_in(f64::NAN), "none measurable");
+        assert_eq!(one_in(1.0), "every lookup");
+    }
+
+    #[test]
+    fn magnitudes_read_as_words() {
+        assert_eq!(magnitude(1.2e9), "1.2 billion");
+        assert_eq!(magnitude(8.47e8), "847 million");
+        assert_eq!(magnitude(999.0), "999");
+    }
+
     #[test]
     fn byte_counts_pick_a_readable_unit() {
         assert_eq!(bytes(512), "512 B");
+        assert_eq!(bytes(524_288), "524.3 KB");
+        assert_eq!(bytes(70_123_456), "70.1 MB");
         assert_eq!(bytes(7_617_111_912), "7.6 GB");
     }
 }

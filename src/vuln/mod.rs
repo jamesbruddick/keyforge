@@ -170,7 +170,23 @@ pub trait Vulnerability: Send + Sync {
         None
     }
 
-    /// The banner lines: what this is, and what its scope assumes.
+    /// How this one is classified, in a few words: its CVE, or why it has none.
+    ///
+    /// The banner sets it beside the id. It used to be the parenthetical on
+    /// [`describe`](Vulnerability::describe)'s first line, which meant the banner was
+    /// handed a pre-formatted title it could only print as it stood -- and meant every
+    /// plugin had to remember to open with its own name. Making it a field is what lets
+    /// the banner lay the two out as a labelled row, and what stops "the first line is
+    /// the title" being a convention nine plugins keep and the tenth quietly breaks.
+    fn classification(&self) -> &'static str {
+        "no CVE"
+    }
+
+    /// The banner's prose: what this is, and what its scope assumes.
+    ///
+    /// Not the name and not the classification -- those are [`id`](Vulnerability::id) and
+    /// [`classification`](Vulnerability::classification), and the banner places them. One
+    /// string per paragraph; the terminal decides where the lines fall.
     fn describe(&self) -> Vec<String>;
 
     /// The README and `keyforge vulns <id>` entry.
@@ -374,8 +390,27 @@ mod tests {
     fn every_vulnerability_describes_its_assumption() {
         for v in registry() {
             let text = v.describe().join(" ");
-            assert!(text.contains(v.id()), "{} does not name itself", v.id());
             assert!(text.len() > 80, "{} says too little", v.id());
+            // The banner sets the name and the classification itself, so a plugin that
+            // still opens with its own title would have it printed twice.
+            assert!(
+                !text.starts_with(v.id()),
+                "{} repeats its own name; the banner already prints it",
+                v.id()
+            );
+        }
+    }
+
+    /// The banner sets the classification beside the id, so every plugin needs one and
+    /// a CVE'd one must not disagree with its own `cve()`.
+    #[test]
+    fn every_vulnerability_is_classified() {
+        for v in registry() {
+            let class = v.classification();
+            assert!(!class.is_empty(), "{} has no classification", v.id());
+            if let Some(cve) = v.cve() {
+                assert_eq!(class, cve, "{} classifies itself as neither its CVE nor none", v.id());
+            }
         }
     }
 

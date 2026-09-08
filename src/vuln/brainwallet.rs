@@ -31,13 +31,16 @@ impl Vulnerability for Brainwallet {
     fn id(&self) -> &'static str {
         "brainwallet"
     }
+
+    fn classification(&self) -> &'static str {
+        "no CVE -- a practice, not a bug"
+    }
     fn aliases(&self) -> &'static [&'static str] {
         &["brain"]
     }
 
     fn describe(&self) -> Vec<String> {
         vec![
-            "brainwallet (no CVE -- a practice, not a bug)".into(),
             "privkey = sha256(passphrase), over a corpus you supply. The search space is \
              that file, so a clean pass proves the passphrase was not in your wordlist \
              and nothing more. Only the privkey route applies: the hash is the key, so \

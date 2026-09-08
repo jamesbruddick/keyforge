@@ -691,6 +691,10 @@ impl Vulnerability for MilkSad {
     fn id(&self) -> &'static str {
         "milksad"
     }
+
+    fn classification(&self) -> &'static str {
+        "CVE-2023-39910"
+    }
     fn aliases(&self) -> &'static [&'static str] {
         &["bx", "milk-sad"]
     }
@@ -700,7 +704,6 @@ impl Vulnerability for MilkSad {
 
     fn describe(&self) -> Vec<String> {
         vec![
-            "milksad (CVE-2023-39910)".into(),
             "libbitcoin `bx seed`: a 32-bit timestamp seeded std::mt19937, so \
              --start/--end can be narrowed to the years bx was in use."
                 .into(),
@@ -770,6 +773,10 @@ impl Vulnerability for TrustWallet {
     fn id(&self) -> &'static str {
         "trust-wallet"
     }
+
+    fn classification(&self) -> &'static str {
+        "CVE-2023-31290"
+    }
     fn aliases(&self) -> &'static [&'static str] {
         &["trustwallet"]
     }
@@ -779,7 +786,6 @@ impl Vulnerability for TrustWallet {
 
     fn describe(&self) -> Vec<String> {
         vec![
-            "trust-wallet (CVE-2023-31290)".into(),
             "Trust Wallet Core < 3.1.1 (extension 0.0.172-0.0.182): std::mt19937 seeded \
              from a 32-bit random_device, 128-bit entropy and 12-word BIP39 only. The \
              seed is not a timestamp, so the range is the whole 2^32 and narrowing it \
@@ -843,13 +849,16 @@ impl Vulnerability for PhpMt {
     fn id(&self) -> &'static str {
         "php-mt"
     }
+
+    fn classification(&self) -> &'static str {
+        "no CVE -- a generator class, not a product"
+    }
     fn aliases(&self) -> &'static [&'static str] {
         &["php"]
     }
 
     fn describe(&self) -> Vec<String> {
         vec![
-            "php-mt (no CVE -- a generator class, not a product)".into(),
             "PHP mt_rand: both engine modes are walked (>= 7.1 masks the low byte, \
              < 7.1 twists wrong and takes the high byte). What a given page did with \
              the bytes is unknown, so this scope is a guess and a miss here proves \
