@@ -1,8 +1,11 @@
-//! Entropy to BIP39 English mnemonic.
+//! BIP39 English mnemonics, both directions.
 //!
-//! Only the encoding direction is needed: the scanner produces phrases, it never
-//! parses them from the wire (except in `verify`, where correctness matters more
-//! than speed).
+//! Encoding is the hot path -- the scanner produces a phrase per point per material
+//! size, billions of times -- and is written to reuse one caller-owned `String`.
+//!
+//! Decoding is entirely cold. It exists for `verify`, which takes a phrase from the
+//! command line, and for the check that every line written to `matches.txt` really is
+//! an importable secret. Neither cares about speed, so it is written for clarity.
 
 use sha2::{Digest, Sha256};
 use std::sync::LazyLock;
@@ -17,8 +20,15 @@ pub static WORDLIST: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     words
 });
 
-/// The entropy sizes `bx seed` could emit, in bytes.
-pub const VALID_ENTROPY_SIZES: [usize; 3] = [16, 24, 32];
+/// Every entropy size BIP39 defines, in bytes: 12, 15, 18, 21 and 24 words.
+///
+/// The scanner this grew out of listed only 16, 24 and 32, because those were the three
+/// `bx seed` could emit. Keeping that here would make the encoder narrower than the
+/// decoder and, worse, would panic on a vulnerability that produced 20 or 28 bytes --
+/// which is a property of the affected software, not something this module gets to
+/// decide. A vulnerability still narrows to the sizes it could actually have produced
+/// through its own defaults.
+pub const VALID_ENTROPY_SIZES: [usize; 5] = [16, 20, 24, 28, 32];
 
 /// Longest mnemonic: 24 words of at most 8 chars plus separators.
 pub const MAX_PHRASE_LEN: usize = 24 * 9;
@@ -66,11 +76,146 @@ pub fn write_mnemonic(entropy: &[u8], out: &mut String) {
     debug_assert_eq!(emitted, total_bits / 11);
 }
 
+/// A phrase back to its entropy, or `None` if it is not a valid BIP39 mnemonic.
+///
+/// Rejects, in this order: a word count that is not 12, 15, 18, 21 or 24; a word not in
+/// the list; and a checksum that does not match. The checksum is the point -- a phrase
+/// with the right words in the wrong order almost always fails it, which is what makes
+/// this a real check on a line of output rather than a spell check.
+///
+/// Word lookup is linear over 2048 entries. That is fine: the callers are `verify` and
+/// the output contract test, not the walk.
+pub fn decode(phrase: &str) -> Option<Vec<u8>> {
+    let words = &*WORDLIST;
+    let parts: Vec<&str> = phrase.split_whitespace().collect();
+    if !matches!(parts.len(), 12 | 15 | 18 | 21 | 24) {
+        return None;
+    }
+
+    // 11 bits per word, of which the trailing `words / 3` are the checksum. Expanded to
+    // one bit per entry rather than shifted through an accumulator: this is a cold path,
+    // and the accumulator version has an off-by-one waiting in it at every boundary.
+    let mut bits: Vec<u8> = Vec::with_capacity(parts.len() * 11);
+    for part in &parts {
+        let index = words.iter().position(|w| w == part)? as u16;
+        for shift in (0..11).rev() {
+            bits.push(((index >> shift) & 1) as u8);
+        }
+    }
+
+    let checksum_bits = parts.len() / 3;
+    let entropy_bits = bits.len() - checksum_bits;
+    let mut entropy = vec![0u8; entropy_bits / 8];
+    for (i, bit) in bits[..entropy_bits].iter().enumerate() {
+        entropy[i / 8] |= bit << (7 - i % 8);
+    }
+
+    // The checksum is the leading bits of sha256(entropy). This is what makes decoding a
+    // real check rather than a spell check: the right words in the wrong order almost
+    // always fail here.
+    let want = Sha256::digest(&entropy)[0];
+    for (i, bit) in bits[entropy_bits..].iter().enumerate() {
+        if *bit != (want >> (7 - i)) & 1 {
+            return None;
+        }
+    }
+    Some(entropy)
+}
+
+/// Whether `phrase` is a well-formed BIP39 mnemonic with a valid checksum.
+pub fn mnemonic_is_valid(phrase: &str) -> bool {
+    decode(phrase).is_some()
+}
+
 /// Convenience wrapper for tests, `verify`, and other cold paths.
 pub fn mnemonic(entropy: &[u8]) -> String {
     let mut out = String::with_capacity(MAX_PHRASE_LEN);
     write_mnemonic(entropy, &mut out);
     out
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+
+    /// Decoding must invert encoding at every valid size, for entropy that is not all
+    /// one byte -- an off-by-one in the bit packing survives an all-zero round trip.
+    #[test]
+    fn round_trips_every_entropy_size() {
+        for size in [16usize, 20, 24, 28, 32] {
+            let entropy: Vec<u8> = (0..size).map(|i| (i as u8).wrapping_mul(37).wrapping_add(11)).collect();
+            let phrase = mnemonic(&entropy);
+            assert_eq!(
+                decode(&phrase).as_deref(),
+                Some(&entropy[..]),
+                "{size}-byte entropy did not survive a round trip"
+            );
+        }
+    }
+
+    /// The published BIP39 vectors, decoded.
+    #[test]
+    fn decodes_the_published_vectors() {
+        assert_eq!(
+            decode(
+                "abandon abandon abandon abandon abandon abandon \
+                 abandon abandon abandon abandon abandon about"
+            )
+            .as_deref(),
+            Some(&[0u8; 16][..])
+        );
+        assert_eq!(
+            decode(
+                "legal winner thank year wave sausage worth useful legal winner thank yellow"
+            )
+            .as_deref(),
+            Some(&[0x7f; 16][..])
+        );
+    }
+
+    /// A wrong checksum must be rejected, or this is a spell check rather than a
+    /// validity check -- and `matches.txt` would be allowed to contain phrases that open
+    /// nothing.
+    #[test]
+    fn rejects_a_broken_checksum() {
+        // The all-zero vector with its last word changed to another valid word.
+        let bad = "abandon abandon abandon abandon abandon abandon \
+                   abandon abandon abandon abandon abandon abandon";
+        assert_eq!(decode(bad), None);
+
+        // Swapping two words almost always breaks the checksum.
+        assert_eq!(
+            decode("about abandon abandon abandon abandon abandon \
+                    abandon abandon abandon abandon abandon abandon"),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_phrases() {
+        assert_eq!(decode(""), None);
+        assert_eq!(decode("abandon"), None);
+        // A word not in the list.
+        assert_eq!(
+            decode("zzzz abandon abandon abandon abandon abandon \
+                    abandon abandon abandon abandon abandon about"),
+            None
+        );
+        // 13 words: not a valid length.
+        assert_eq!(
+            decode("abandon abandon abandon abandon abandon abandon abandon \
+                    abandon abandon abandon abandon abandon about"),
+            None
+        );
+    }
+
+    /// Extra whitespace is not a reason to reject a phrase a user pasted.
+    #[test]
+    fn tolerates_surrounding_whitespace() {
+        let phrase = mnemonic(&[0u8; 16]);
+        let padded = format!("  {}  ", phrase.replace(' ', "   "));
+        assert_eq!(decode(&padded).as_deref(), Some(&[0u8; 16][..]));
+    }
 }
 
 #[cfg(test)]

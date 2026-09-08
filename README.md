@@ -32,7 +32,18 @@ small, local piece of work rather than a new tool.
 keyforge vulns                        # what can be scanned, and how
 keyforge vulns milksad                # the full guide for one
 keyforge scan --vuln milksad -f funded.bf
-keyforge verify --vuln milksad "<phrase>"
+```
+
+The scope every scan uses comes from the vulnerability, and every part of it is
+overridable:
+
+```
+keyforge scan --vuln glibc-rand -f funded.bf \
+  --start 1420070400 --end 1451606400 \
+  --path "m/44'/0'/0'/{0,1}/{0..19}" \
+  --routes bip39,privkey \
+  --material 16,32 \
+  --details
 ```
 
 Any scan can be stopped with Ctrl-C and resumed later by re-running the same command.
@@ -241,13 +252,16 @@ cargo test --features metal    # or --features cuda / --features cuda12
 
 ```
 cargo build --release                      # CPU only
-cargo build --release --features metal     # Apple GPUs
-cargo build --release --features cuda      # NVIDIA, CUDA 13.x driver
-cargo build --release --features cuda12    # NVIDIA, driver older than 580
 ```
 
-Kernels are compiled from source at run time, so no build needs a GPU toolchain and one
-binary runs on a freshly rented box.
+**GPU support is not ported yet.** The `metal`, `cuda` and `cuda12` feature flags are
+reserved for it and currently fail the build with a message saying so, rather than
+building successfully and then running everything on the CPU at a fortieth of the speed
+you asked for.
+
+Corpus scanning (`brainwallet`) is likewise not wired up yet; `keyforge scan` says so
+plainly rather than walking an empty range and reporting a clean pass. Every other
+vulnerability listed by `keyforge vulns` can be scanned now.
 
 ## License
 

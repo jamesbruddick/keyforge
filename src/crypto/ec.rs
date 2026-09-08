@@ -866,9 +866,14 @@ fn build_comb_for_gpu() -> Vec<u8> {
 
 /// The public key for a single scalar.
 ///
-/// The scan always has a batch to share an inversion with, so this exists for the
-/// tests -- including `crate::scan::derive`'s, which check the tree one node at a time.
-#[cfg(test)]
+/// One public key, with an inversion all to itself.
+///
+/// The scan proper never comes through here: it always has a level's worth of scalars to
+/// share an inversion with, which is the whole reason `Batch` exists. This is for the
+/// callers that genuinely have one key and nothing to batch it with -- the tests, which
+/// check the tree a node at a time, and `derive::leaf_private_key`, which re-derives a
+/// single leaf after a filter match. Both are cold paths where an inversion per key
+/// costs nothing worth measuring.
 pub fn public_key(scalar: &[u8; 32]) -> Ge {
     to_affine(std::slice::from_ref(&mul_gen(scalar)))[0]
 }

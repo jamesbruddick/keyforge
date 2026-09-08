@@ -565,6 +565,23 @@ pub fn percent(done: u64, total: u64) -> f64 {
 }
 
 /// Thousands separators, so ten-digit seed counts stay readable.
+/// The same, for a count that can exceed `u64`.
+///
+/// Search spaces are `u128` -- `java-random`'s is 2^48 and nothing stops a future one
+/// being wider -- and a point count printed through a `u64` would be silently wrong for
+/// exactly the vulnerabilities where the number matters most.
+pub fn commas_u128(value: u128) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub fn commas(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() * 4 / 3);

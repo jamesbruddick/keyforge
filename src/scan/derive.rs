@@ -682,6 +682,46 @@ impl Deriver {
     }
 }
 
+/// The private key of one leaf, re-derived from the material that produced it.
+///
+/// This is the **cold path**: it walks a single path one node at a time, with no shared
+/// inversion and no hoisted HMAC, and it allocates. That is fine, because the only
+/// caller is the match sink, and a match happens roughly once in a billion points. Doing
+/// it this way keeps the hot loop from carrying a 32-byte key through every chunk for
+/// the sake of the one record in a billion that needs it.
+///
+/// Returns `None` for material a route cannot use -- a `PrivKey` route on anything but
+/// 32 bytes, or the ~2^-127 cases where a derivation step lands outside the curve order.
+pub fn leaf_private_key(
+    material: &[u8],
+    route: Route,
+    spec: Option<&PathSpec>,
+    leaf: u64,
+) -> Option<[u8; 32]> {
+    let node = match route {
+        Route::PrivKey => {
+            let bytes: [u8; 32] = material.try_into().ok()?;
+            return SecretKey::from_byte_array(bytes).ok().map(|k| k.secret_bytes());
+        }
+        Route::Bip39 => master(&pbkdf2::bip39_seed(&bip39::mnemonic(material)))?,
+        Route::Bip32Seed => master(material)?,
+    };
+
+    let mut node = node;
+    for child in spec?.leaf(leaf)? {
+        node = if child & crate::wallet::path::HARDENED != 0 {
+            derive_hardened(&node, child)?
+        } else {
+            let public = ec::public_key(&node.key.secret_bytes());
+            let mut data = [0u8; 37];
+            data[..33].copy_from_slice(&public.serialize());
+            data[33..].copy_from_slice(&child.to_be_bytes());
+            ckd(&node, &data)?
+        };
+    }
+    Some(node.key.secret_bytes())
+}
+
 /// Append every requested hash form for one public key to the pending chunk.
 #[inline]
 fn emit_forms(
