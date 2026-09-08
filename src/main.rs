@@ -150,6 +150,10 @@ struct ScanArgs {
     #[arg(short, long, value_name = "PATH")]
     filter: PathBuf,
 
+    /// Passphrase list, one per line, for a vulnerability that walks a corpus.
+    #[arg(long, value_name = "PATH")]
+    corpus: Option<PathBuf>,
+
     /// Where candidate secrets are written, one per line.
     #[arg(short, long, value_name = "PATH", default_value = "matches.txt")]
     out: PathBuf,
@@ -210,30 +214,45 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
     let v = args.scope.vulnerability()?;
     let scope = args.scope.to_scope(v)?;
 
-    // A corpus vulnerability walks a file, not a number range, and needs a reader and a
-    // different checkpoint. Saying so plainly beats scanning an empty range and
-    // reporting a clean pass.
-    let (space_start, space_end) = match v.space() {
-        Space::Integers { start, end } => (start, end),
-        Space::Corpus => bail!(
-            "`{}` walks a passphrase corpus rather than a number range, and corpus \
-             scanning is not wired up yet.\nEvery other vulnerability in `keyforge \
-             vulns` is an integer space and can be scanned now.",
-            v.id()
-        ),
-    };
-
-    let start = args.start.unwrap_or(space_start);
-    let end = args.end.unwrap_or(space_end);
-    if start >= end {
-        bail!("--start {start} is not below --end {end}");
-    }
-    if start < space_start || end > space_end {
+    // A corpus vulnerability walks a file; everything else walks a number range. The two
+    // need different readers, different progress and different checkpoints, so which one
+    // this is gets settled here rather than being threaded through the engine.
+    let corpus = matches!(v.space(), Space::Corpus);
+    if corpus && args.corpus.is_none() {
         bail!(
-            "range {start}..{end} falls outside `{}`'s space of {space_start}..{space_end}",
+            "`{}` walks a passphrase corpus, so it needs one: --corpus <FILE>, \
+             one passphrase per line",
             v.id()
         );
     }
+    if !corpus && args.corpus.is_some() {
+        bail!(
+            "`{}` walks a number range, not a corpus. Narrow it with --start and --end.",
+            v.id()
+        );
+    }
+
+    let (space_start, space_end) = match v.space() {
+        Space::Integers { start, end } => (start, end),
+        Space::Corpus => (0, 0),
+    };
+    let (start, end) = if corpus {
+        (0, 0)
+    } else {
+        let start = args.start.unwrap_or(space_start);
+        let end = args.end.unwrap_or(space_end);
+        if start >= end {
+            bail!("--start {start} is not below --end {end}");
+        }
+        if start < space_start || end > space_end {
+            bail!(
+                "range {start}..{end} falls outside `{}`'s space of \
+                 {space_start}..{space_end}",
+                v.id()
+            );
+        }
+        (start, end)
+    };
 
     let threads = args.threads.unwrap_or_else(|| {
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
@@ -251,7 +270,7 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
     // Narrowing a range is only sound for a vulnerability whose points have structure a
     // user can reason about. Everywhere else it leaves a hole, and saying so is the
     // whole reason `range_is_narrowable` exists.
-    let narrowed = start != space_start || end != space_end;
+    let narrowed = !corpus && (start != space_start || end != space_end);
     if narrowed && !v.range_is_narrowable() {
         ui.warn(&format!(
             "`{}`'s points have no time structure, so a narrowed range is a hole \
@@ -262,16 +281,26 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
 
     let target = load_filter(ui, &args.filter, &scope)?;
 
-    let total = end - start;
     ui.row("vulnerability", v.id());
     if let Some(cve) = v.cve() {
         ui.row("cve", cve);
     }
-    ui.row("range", &format!("{start} .. {end}  ({} points)", ui::commas_u128(total)));
+    match &args.corpus {
+        Some(path) => ui.row("corpus", &path.display().to_string()),
+        None => ui.row(
+            "range",
+            &format!("{start} .. {end}  ({} points)", ui::commas_u128(end - start)),
+        ),
+    }
     ui.row("material", &fmt(&scope.material_sizes, |s| format!("{s}B")));
     ui.row("routes", &fmt(&scope.routes, |r| r.as_str().to_string()));
-    for (i, path) in scope.paths.iter().enumerate() {
-        ui.row(if i == 0 { "paths" } else { "" }, &path.to_string());
+    // Only shown when something actually walks them. A privkey-only scope carries the
+    // default path set and never touches it, and listing paths a scan does not walk
+    // invites exactly the wrong conclusion about what a clean pass covered.
+    if scope.routes.iter().any(|r| r.derives()) {
+        for (i, path) in scope.paths.iter().enumerate() {
+            ui.row(if i == 0 { "paths" } else { "" }, &path.to_string());
+        }
     }
     ui.row("hash forms", &fmt(&scope.forms, |f| f.as_str().to_string()));
     ui.row(
@@ -293,6 +322,11 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
         parts.push(args.filter.display().to_string());
         parts.push(start.to_string());
         parts.push(end.to_string());
+        // A corpus is identified by its contents, not its path: the same name holding a
+        // different file would make a resume skip lines it never walked.
+        if let Some(path) = &args.corpus {
+            parts.push(engine::corpus_fingerprint(path)?);
+        }
         parts
     };
     let refs: Vec<&str> = fingerprint_parts.iter().map(|s| s.as_str()).collect();
@@ -300,6 +334,7 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
 
     let config = ScanConfig {
         filter: args.filter.clone(),
+        corpus: args.corpus.clone(),
         out: args.out,
         details: args.details,
         start,
@@ -309,15 +344,20 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
         restart: args.restart,
     };
 
-    let report = engine::run(ui, v, &scope, &target, &config, &fingerprint, &state_path)?;
+    let report = if corpus {
+        engine::run_corpus(ui, v, &scope, &target, &config, &fingerprint, &state_path)?
+    } else {
+        engine::run(ui, v, &scope, &target, &config, &fingerprint, &state_path)?
+    };
 
     ui.gap();
     let rate = report.points_done as f64 / report.elapsed.as_secs_f64().max(1e-9);
     ui.row_strong(
         if report.finished { "finished" } else { "stopped" },
         &format!(
-            "{} points in {} ({:.0}/s)",
+            "{} {} in {} ({:.0}/s)",
             ui::commas(report.points_done),
+            if corpus { "passphrases" } else { "points" },
             ui::duration(report.elapsed.as_secs_f64()),
             rate
         ),
@@ -339,11 +379,92 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
     Ok(())
 }
 
+/// Total physical RAM, where the platform will say.
+#[cfg(target_os = "linux")]
+fn physical_ram() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+#[cfg(target_os = "macos")]
+fn physical_ram() -> Option<u64> {
+    let mut bytes: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: the name is a NUL-terminated C string, and the out-buffer is a live u64
+    // whose size is what `len` reports.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&raw mut bytes).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0).then_some(bytes)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn physical_ram() -> Option<u64> {
+    None
+}
+
+/// Refuse a filter pair that cannot fit in RAM, before spending twenty minutes proving it.
+///
+/// Filters are read into memory whole rather than mapped, and deliberately: probes are
+/// uniform over the whole bit space, so anything short of resident degrades to a page
+/// fault per probe and a sweep that would have taken days takes years. The consequence is
+/// that the pair has to fit, and a pair that does not produces swapping rather than an
+/// error -- the process stays alive, makes almost no progress, and gives no clue why.
+///
+/// A verification companion is optional, so when only *it* pushes the total over the
+/// edge the useful thing is to say so and carry on without it: a scan with no companion
+/// works fine, it just reports more false positives for triage to rule out.
+fn check_memory(ui: &Ui, filter: &std::path::Path) -> Result<bool> {
+    let size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let primary = size(filter);
+    let companion_path = keyforge::target::verify_path(filter);
+    let companion = if companion_path.exists() { size(&companion_path) } else { 0 };
+
+    let Some(ram) = physical_ram() else {
+        return Ok(true);
+    };
+    // Leave a margin for the derivation buffers, the page cache and the rest of the
+    // machine. A filter that exactly fills RAM still swaps.
+    let usable = ram - (ram / 8).min(2 << 30);
+
+    if primary > usable {
+        bail!(
+            "the filter is {} and this machine has {} of RAM.\n\
+             Filters are held resident on purpose -- probes are uniform over the whole \
+             bit space, so a filter that has to be paged in makes a sweep hundreds of \
+             times slower rather than a little slower.\n\
+             Use a smaller filter, or a machine with more memory.",
+            ui::bytes(primary),
+            ui::bytes(ram)
+        );
+    }
+    if companion > 0 && primary + companion > usable {
+        ui.warn(&format!(
+            "the filter and its verification companion are {} together, which does not \
+             fit in {} of RAM. Scanning with the filter alone: candidates will still be \
+             correct, there will just be more false positives for triage to rule out.",
+            ui::bytes(primary + companion),
+            ui::bytes(ram)
+        ));
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 /// Open the filter, and say plainly if it cannot answer for part of the scope.
 fn load_filter(ui: &Ui, path: &std::path::Path, scope: &Scope) -> Result<Target> {
+    let with_companion = check_memory(ui, path)?;
     let primary = BloomFilter::open(path)
         .with_context(|| format!("opening the filter {}", path.display()))?;
-    let verify = Target::open_verify(path)?;
+    let verify = if with_companion { Target::open_verify(path)? } else { None };
     let target = Target::new(primary, verify);
 
     // A filter built without, say, P2SH entries will never match a form the scan spends

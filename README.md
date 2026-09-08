@@ -32,6 +32,7 @@ small, local piece of work rather than a new tool.
 keyforge vulns                        # what can be scanned, and how
 keyforge vulns milksad                # the full guide for one
 keyforge scan --vuln milksad -f funded.bf
+keyforge scan --vuln brainwallet --corpus phrases.txt -f funded.bf
 ```
 
 The scope every scan uses comes from the vulnerability, and every part of it is
@@ -73,6 +74,7 @@ code. `keyforge vulns <id>` prints the same words.
 
 ```
 keyforge scan --vuln milksad -f funded.bf
+keyforge scan --vuln brainwallet --corpus phrases.txt -f funded.bf
 ```
 
 **Time:** About 9 days on a laptop, or 9 hours on a recent NVIDIA card. Because the seed was a clock reading you can narrow it to when the tool was actually in use, which cuts that several-fold.
@@ -259,9 +261,17 @@ reserved for it and currently fail the build with a message saying so, rather th
 building successfully and then running everything on the CPU at a fortieth of the speed
 you asked for.
 
-Corpus scanning (`brainwallet`) is likewise not wired up yet; `keyforge scan` says so
-plainly rather than walking an empty range and reporting a clean pass. Every other
-vulnerability listed by `keyforge vulns` can be scanned now.
+## Memory
+
+Filters are read into memory **whole**, not memory-mapped. That is deliberate: probes are
+uniform over the entire bit space, so a filter that has to be paged in costs a page fault
+per probe and turns a sweep of days into one of years.
+
+The consequence is that the filter has to fit in RAM, and `keyforge scan` checks before it
+starts rather than discovering it half an hour into swapping. If a verification companion
+is what pushes the pair over the edge, the scan says so and continues with the filter
+alone -- candidates are still correct, there are just more false positives for triage to
+rule out.
 
 ## License
 

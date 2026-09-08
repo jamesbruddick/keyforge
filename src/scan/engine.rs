@@ -31,15 +31,20 @@ use crate::target::Target;
 use crate::ui::{self, Ui};
 use crate::vuln::{Point, Vulnerability};
 use anyhow::{Context, Result};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Everything a scan needs that is not derived from the vulnerability itself.
 pub struct ScanConfig {
     pub filter: PathBuf,
+    /// The passphrase corpus, for a vulnerability whose space is a file rather than a
+    /// number range.
+    pub corpus: Option<PathBuf>,
     pub out: PathBuf,
     pub details: Option<PathBuf>,
     pub start: u128,
@@ -172,14 +177,12 @@ pub fn run(
     let completed: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
     let watermark = AtomicU64::new(resume_blocks);
     let points_done = AtomicU64::new(0);
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = install_interrupt(ui)?;
     // Set by a worker that found something, cleared by the monitor when it acts on it. A
     // find repaints the progress bar underneath itself, and without this the bar would
     // be redrawn with the count from the last tick -- reading "0 candidates" directly
     // below the candidate that had just been announced.
     let found = AtomicBool::new(false);
-
-    install_interrupt(ui, &stop)?;
 
     let began = Instant::now();
     std::thread::scope(|s| {
@@ -381,6 +384,294 @@ pub fn run(
     })
 }
 
+/// Hands out blocks of corpus lines, in order, to whichever worker asks next.
+///
+/// A number range can be divided up front because any block can be computed from its
+/// index. A file cannot: reaching line ten million means reading the nine million before
+/// it. So the division happens here, behind one lock, and a worker claims the next block
+/// rather than computing which block is its own.
+///
+/// The lock is held only for the read, which is a few thousand lines off a buffered
+/// reader -- microseconds against the seconds those lines then take to derive. Blocks are
+/// still numbered, so the watermark and the checkpoint mean exactly what they mean for a
+/// number range.
+struct Corpus {
+    lines: std::io::Lines<BufReader<File>>,
+    next_block: u64,
+    exhausted: bool,
+}
+
+impl Corpus {
+    /// Open a corpus, skipping the blocks a checkpoint says are already done.
+    fn open(path: &Path, block: u64, skip_blocks: u64) -> Result<Self> {
+        let file = File::open(path)
+            .with_context(|| format!("opening the corpus {}", path.display()))?;
+        let mut lines = BufReader::new(file).lines();
+
+        // Resuming means reading past what was already walked. There is no cheaper way
+        // into the middle of a text file, and it is still far cheaper than deriving those
+        // lines again.
+        for _ in 0..skip_blocks.saturating_mul(block) {
+            if lines.next().is_none() {
+                break;
+            }
+        }
+        Ok(Self { lines, next_block: skip_blocks, exhausted: false })
+    }
+
+    /// The next block of passphrases, or `None` once the file runs out.
+    ///
+    /// Blank lines are skipped rather than hashed: a trailing newline is not a passphrase,
+    /// and `sha256("")` is a valid private key that would be reported against every corpus
+    /// that happened to end with one.
+    fn claim(&mut self, block: u64, out: &mut Vec<String>) -> Option<u64> {
+        out.clear();
+        if self.exhausted {
+            return None;
+        }
+        while (out.len() as u64) < block {
+            match self.lines.next() {
+                Some(Ok(line)) => {
+                    if !line.trim().is_empty() {
+                        out.push(line);
+                    }
+                }
+                Some(Err(_)) | None => {
+                    self.exhausted = true;
+                    break;
+                }
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        let unit = self.next_block;
+        self.next_block += 1;
+        Some(unit)
+    }
+}
+
+/// A corpus's identity, for the checkpoint.
+///
+/// The full contents, hashed. A resume that read a *different* file from the same path
+/// would skip lines it never walked and walk lines it already had, and neither shows up
+/// as an error -- so the file itself is what the fingerprint commits to, not its name.
+/// One pass over a wordlist is seconds; one pass over a sweep is hours.
+pub fn corpus_fingerprint(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let file = File::open(path)
+        .with_context(|| format!("reading the corpus {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    // Streamed in chunks rather than read whole: a password dump can be larger than RAM,
+    // and the point of hashing it is to catch it changing, not to hold it.
+    loop {
+        let chunk = reader.fill_buf().context("reading the corpus")?;
+        if chunk.is_empty() {
+            break;
+        }
+        hasher.update(chunk);
+        let n = chunk.len();
+        reader.consume(n);
+    }
+    Ok(ui::hex(&hasher.finalize()[..8]))
+}
+
+/// Walk a passphrase corpus, recording filter matches.
+///
+/// Shares the sink, the watermark and the checkpoint with [`run`]; what differs is only
+/// that blocks come from a file in order rather than from arithmetic.
+pub fn run_corpus(
+    ui: &Ui,
+    vuln: &'static dyn Vulnerability,
+    scope: &Scope,
+    target: &Target,
+    config: &ScanConfig,
+    fingerprint: &str,
+    state_path: &Path,
+) -> Result<ScanReport> {
+    let corpus_path = config
+        .corpus
+        .as_ref()
+        .context("this vulnerability needs --corpus")?;
+    let block = config.block.unwrap_or(4096);
+
+    let resume_blocks = match (config.restart, State::load(state_path)?) {
+        (false, Some(state)) if state.fingerprint == fingerprint => {
+            if state.blocks_done > 0 {
+                ui.notice(
+                    "resuming",
+                    &format!(
+                        "{} passphrases already walked",
+                        ui::commas(state.blocks_done * block)
+                    ),
+                );
+            }
+            state.blocks_done
+        }
+        (false, Some(_)) => {
+            ui.warn(
+                "the checkpoint beside this filter describes a different scan -- a                  different corpus, or different flags. Starting over.",
+            );
+            0
+        }
+        _ => 0,
+    };
+
+    let corpus = Mutex::new(Corpus::open(corpus_path, block, resume_blocks)?);
+    let sink = Mutex::new(MatchSink::open(ui, &config.out, config.details.as_deref())?);
+    let completed: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+    let watermark = AtomicU64::new(resume_blocks);
+    let points_done = AtomicU64::new(0);
+    let done_reading = AtomicBool::new(false);
+    let stop = install_interrupt(ui)?;
+    let found = AtomicBool::new(false);
+
+    let began = Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..config.threads {
+            let (target, scope, sink, stop, found) = (target, scope, &sink, &stop, &found);
+            let (corpus, completed, watermark, points_done, done_reading) =
+                (&corpus, &completed, &watermark, &points_done, &done_reading);
+            s.spawn(move || {
+                let mut deriver = Deriver::new();
+                let mut expanded: Vec<[u8; 32]> = Vec::new();
+                let mut lines: Vec<String> = Vec::new();
+                let mut batch: Vec<[u8; 32]> = Vec::with_capacity(derive::POINTS_PER_BATCH);
+                let mut candidates = Candidates {
+                    target,
+                    scope,
+                    sink,
+                    found,
+                    vuln: vuln.id(),
+                    base: 0,
+                    stream: 0,
+                    materials: [[0u8; 32]; derive::POINTS_PER_BATCH],
+                };
+
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let Some(unit) = corpus.lock().unwrap().claim(block, &mut lines) else {
+                        done_reading.store(true, Ordering::Relaxed);
+                        break;
+                    };
+
+                    let mut interrupted = false;
+                    // A passphrase can expand to more than one key -- a brainwallet is
+                    // hashed once and twice -- and every material of a line is walked
+                    // inside this block, so a block stays complete or not.
+                    for (i, line) in lines.iter().enumerate() {
+                        if stop.load(Ordering::Relaxed) {
+                            interrupted = true;
+                            break;
+                        }
+                        expanded.clear();
+                        vuln.expand(Point::Input(line.as_bytes()), &mut expanded);
+                        for material in &expanded {
+                            batch.clear();
+                            batch.push(*material);
+                            candidates.base = unit as u128 * block as u128 + i as u128;
+                            candidates.materials[0] = *material;
+                            deriver.walk_batch(&batch, scope, &mut candidates);
+                        }
+                    }
+                    points_done.fetch_add(lines.len() as u64, Ordering::Relaxed);
+
+                    if interrupted {
+                        break;
+                    }
+                    let mut done = completed.lock().unwrap();
+                    done.insert(unit);
+                    let mut mark = watermark.load(Ordering::Relaxed);
+                    while done.remove(&mark) {
+                        mark += 1;
+                    }
+                    watermark.store(mark, Ordering::Relaxed);
+                }
+            });
+        }
+
+        let (sink, stop, found) = (&sink, &stop, &found);
+        let (watermark, points_done, done_reading) = (&watermark, &points_done, &done_reading);
+        s.spawn(move || {
+            let interval = if ui.interactive() {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_secs(60)
+            };
+            let mut last_checkpoint = Instant::now();
+            let mut announced_stop = false;
+            loop {
+                for _ in 0..(interval.as_millis() / 100) {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if stop.load(Ordering::Relaxed)
+                        || done_reading.load(Ordering::Relaxed)
+                        || found.swap(false, Ordering::Relaxed)
+                    {
+                        break;
+                    }
+                }
+                if stop.load(Ordering::Relaxed) && !announced_stop {
+                    announced_stop = true;
+                    ui.notice("interrupted", "finishing the block in flight and checkpointing");
+                }
+
+                let finished = done_reading.load(Ordering::Relaxed);
+                if !finished {
+                    let done = points_done.load(Ordering::Relaxed);
+                    let rate = done as f64 / began.elapsed().as_secs_f64().max(1e-9);
+                    let candidates = sink.lock().unwrap().candidates;
+                    // A corpus has no known length until it has been read, so there is no
+                    // percentage and no ETA to give. Saying how far it has got is the most
+                    // that is true.
+                    ui.progress(
+                        "scanning",
+                        0,
+                        0,
+                        "passphrases",
+                        &[
+                            format!("{} walked", ui::commas(done)),
+                            format!("{rate:.0}/s"),
+                            format!("{} candidates", ui::commas(candidates)),
+                        ],
+                    );
+                }
+                if last_checkpoint.elapsed() >= Duration::from_secs(10) && !finished {
+                    let mark = watermark.load(Ordering::Relaxed);
+                    if let Err(e) = save(state_path, fingerprint, config, block, mark) {
+                        ui.warn(&format!("could not write the checkpoint: {e:#}"));
+                    }
+                    last_checkpoint = Instant::now();
+                }
+                if finished || stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        });
+    });
+
+    let finished = done_reading.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed);
+    if finished {
+        State::clear(state_path)?;
+    } else {
+        save(state_path, fingerprint, config, block, watermark.load(Ordering::Relaxed))?;
+    }
+
+    ui.clear();
+    let sink = sink.lock().unwrap();
+    let points_done = points_done.load(Ordering::Relaxed);
+    Ok(ScanReport {
+        points_done,
+        total_points: points_done as u128,
+        candidates: sink.candidates,
+        locations: sink.locations,
+        elapsed: began.elapsed(),
+        finished,
+    })
+}
+
 fn save(
     path: &Path,
     fingerprint: &str,
@@ -401,30 +692,49 @@ fn save(
     .save(path)
 }
 
-/// Install the Ctrl-C handler.
+/// The process-wide stop flag, reset for each scan.
 ///
-/// The handler only sets a flag. Announcing the interrupt is left to the monitor thread,
-/// which picks it up within 100ms: it owns the progress bar and can put it back
-/// afterwards, and printing from a signal handler means taking the stderr lock from a
-/// context that may already hold it. A second Ctrl-C kills the process outright rather
-/// than being swallowed.
-fn install_interrupt(ui: &Ui, stop: &Arc<AtomicBool>) -> Result<()> {
-    let stop = Arc::clone(stop);
-    let armed = AtomicBool::new(false);
-    // `process::exit` runs no destructors, so `Drop for Ui` never gets to put the cursor
-    // back on that path. Whether it was hidden is captured here rather than read through
-    // the `Ui`, which the handler outlives.
-    let hid_cursor = ui.interactive();
-    ctrlc::set_handler(move || {
-        if armed.swap(true, Ordering::SeqCst) {
-            if hid_cursor {
-                ui::show_cursor();
+/// A signal handler is a property of the *process*, and `ctrlc` refuses a second
+/// registration outright. Running two scans in one process is a perfectly reasonable
+/// thing to do -- the tests do it, and a future `scan --vuln a --vuln b` would -- so the
+/// handler is installed once and the flag it sets is cleared at the start of each run,
+/// rather than a new handler being installed per scan and the second one failing.
+fn install_interrupt(ui: &Ui) -> Result<Arc<AtomicBool>> {
+    static STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    static INSTALLED: Once = Once::new();
+
+    let stop = STOP.get_or_init(|| Arc::new(AtomicBool::new(false)));
+
+    // The handler only sets the flag. Announcing the interrupt is left to the monitor
+    // thread, which picks it up within 100ms: it owns the progress bar and can put it
+    // back afterwards, and printing from a signal handler means taking the stderr lock
+    // from a context that may already hold it. A second Ctrl-C kills the process outright
+    // rather than being swallowed.
+    let mut outcome = Ok(());
+    INSTALLED.call_once(|| {
+        let stop = Arc::clone(stop);
+        let armed = AtomicBool::new(false);
+        // `process::exit` runs no destructors, so `Drop for Ui` never gets to put the
+        // cursor back on that path. Whether it was hidden is captured here rather than
+        // read through the `Ui`, which the handler outlives.
+        let hid_cursor = ui.interactive();
+        outcome = ctrlc::set_handler(move || {
+            if armed.swap(true, Ordering::SeqCst) {
+                if hid_cursor {
+                    ui::show_cursor();
+                }
+                std::process::exit(130);
             }
-            std::process::exit(130);
-        }
-        stop.store(true, Ordering::SeqCst);
-    })
-    .context("installing the interrupt handler")
+            stop.store(true, Ordering::SeqCst);
+        })
+        .context("installing the interrupt handler");
+    });
+    outcome?;
+
+    // Cleared per run, so a scan that follows an interrupted one is not stopped before it
+    // starts.
+    stop.store(false, Ordering::SeqCst);
+    Ok(Arc::clone(stop))
 }
 
 #[cfg(test)]
@@ -536,6 +846,7 @@ mod tests {
         };
         let config = ScanConfig {
             filter: filter_path.clone(),
+            corpus: None,
             out: out.clone(),
             details: None,
             start: 490,
@@ -602,5 +913,118 @@ mod tests {
         }
         assert_eq!(mark, 3);
         assert_eq!(done.iter().copied().collect::<Vec<_>>(), vec![4]);
+    }
+}
+
+#[cfg(test)]
+mod corpus_tests {
+    use super::*;
+    use crate::scan::derive::Route;
+    use crate::scan::sink::is_importable_secret;
+    use crate::target::bloom::testing::{reference_add, scratch, write_filter};
+    use crate::wallet::address::HashForm;
+
+    /// A whole corpus scan, end to end.
+    ///
+    /// The filter holds the address for `sha256("satoshi")` -- the canonical brainwallet
+    /// example -- and the corpus contains that phrase among others, including a blank
+    /// line, which must not be hashed: `sha256("")` is a valid private key and would
+    /// otherwise be reported against every corpus that ends with a newline.
+    #[test]
+    fn scans_a_corpus_end_to_end() {
+        use crate::crypto::{ec, hash::hash160};
+        use crate::vuln::brainwallet::Brainwallet;
+
+        let key: [u8; 32] = {
+            let mut out = Vec::new();
+            Brainwallet.expand(Point::Input(b"satoshi"), &mut out);
+            out[0]
+        };
+        let target_hash = hash160(&ec::public_key(&key).serialize());
+
+        let mut bits = vec![0u64; 1 << 16];
+        reference_add(&mut bits, &target_hash);
+        let filter_path = scratch("corpus.bf");
+        write_filter(&filter_path, &bits);
+
+        let corpus = scratch("corpus-phrases.txt");
+        std::fs::write(&corpus, "alpha\nbravo\nsatoshi\n\ncharlie\ndelta\n").unwrap();
+
+        let out = scratch("corpus-matches.txt");
+        let state = scratch("corpus.state");
+        for p in [&out, &state] {
+            let _ = std::fs::remove_file(p);
+        }
+
+        let ui = Ui::new(crate::ui::Stream::Stderr);
+        let target = Target::new(
+            crate::target::bloom::BloomFilter::open(&filter_path).unwrap(),
+            None,
+        );
+        let scope = Scope {
+            material_sizes: vec![32],
+            routes: vec![Route::PrivKey],
+            paths: vec![],
+            forms: vec![HashForm::Compressed],
+        };
+        let config = ScanConfig {
+            filter: filter_path.clone(),
+            corpus: Some(corpus.clone()),
+            out: out.clone(),
+            details: None,
+            start: 0,
+            end: 0,
+            threads: 2,
+            block: Some(2),
+            restart: true,
+        };
+
+        let fp = corpus_fingerprint(&corpus).unwrap();
+        let report =
+            run_corpus(&ui, &Brainwallet, &scope, &target, &config, &fp, &state).unwrap();
+
+        assert!(report.finished, "the corpus scan did not finish");
+        // Five passphrases, not six: the blank line is skipped.
+        assert_eq!(report.points_done, 5, "the blank line was hashed");
+        assert_eq!(report.candidates, 1);
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert!(is_importable_secret(lines[0]));
+        assert_eq!(lines[0], crate::ui::hex(&key));
+
+        // A finished corpus leaves no checkpoint.
+        assert!(!state.exists(), "a finished corpus scan left a checkpoint");
+
+        // The fingerprint is the corpus's contents, so an edited file under the same name
+        // is a different scan and must not be resumed into.
+        std::fs::write(&corpus, "alpha\nbravo\nsatoshi\n\ncharlie\nEDITED\n").unwrap();
+        assert_ne!(corpus_fingerprint(&corpus).unwrap(), fp);
+    }
+
+    /// Resuming must start at exactly the right line -- none re-derived, and more
+    /// importantly none skipped.
+    #[test]
+    fn a_resumed_corpus_starts_at_the_right_line() {
+        let corpus = scratch("corpus-skip.txt");
+        let body: String = (0..100).map(|i| format!("phrase{i}\n")).collect();
+        std::fs::write(&corpus, &body).unwrap();
+
+        // Block of 10, resuming after 3 blocks: the next line must be phrase30.
+        let mut c = Corpus::open(&corpus, 10, 3).unwrap();
+        let mut lines = Vec::new();
+        let unit = c.claim(10, &mut lines).unwrap();
+        assert_eq!(unit, 3, "the resumed block is misnumbered");
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[0], "phrase30");
+        assert_eq!(lines[9], "phrase39");
+
+        // And reading to the end stops rather than looping.
+        let mut seen = lines.len();
+        while c.claim(10, &mut lines).is_some() {
+            seen += lines.len();
+        }
+        assert_eq!(seen, 70, "resuming did not cover the rest of the file exactly once");
     }
 }
