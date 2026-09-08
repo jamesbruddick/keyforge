@@ -880,6 +880,36 @@ pub fn phrase_lines(secret: &str) -> Vec<String> {
         .collect()
 }
 
+/// A secret shortened to something recognisable, for a line that has to name one
+/// without spending itself on it.
+///
+/// A repeat announcement -- the same wallet matching at a second path -- needs to say
+/// *which* wallet, and a resumed sweep is made almost entirely of those: everything
+/// already in `matches.txt` re-derives as a repeat, so a run that showed the full secret
+/// only on the first sighting showed it nowhere at all. Ends included as well as the
+/// beginning, because the beginnings of two mnemonics from the same point can match for
+/// several words.
+pub fn abbreviate(secret: &str) -> String {
+    let words: Vec<&str> = secret.split_whitespace().collect();
+    if words.len() > 4 {
+        return format!(
+            "{} {} … {} {}",
+            words[0],
+            words[1],
+            words[words.len() - 2],
+            words[words.len() - 1]
+        );
+    }
+    // A private key: one long token, shortened by characters instead.
+    let chars: Vec<char> = secret.trim().chars().collect();
+    if chars.len() > 20 {
+        let head: String = chars[..8].iter().collect();
+        let tail: String = chars[chars.len() - 8..].iter().collect();
+        return format!("{head}…{tail}");
+    }
+    secret.trim().to_string()
+}
+
 /// Lowercase hex, for hash160s.
 pub fn hex(data: &[u8]) -> String {
     use std::fmt::Write;
@@ -1065,6 +1095,22 @@ mod tests {
         assert_eq!(phrase_lines(&words(24)).len(), 4);
         let key = "0000000000000000000000000000000000000000000000000000000000000001";
         assert_eq!(phrase_lines(key), [key]);
+    }
+
+    /// A resumed sweep is made almost entirely of repeats, so the line that names a
+    /// secret without printing it is the only place the secret appears at all.
+    #[test]
+    fn a_secret_shortens_to_something_recognisable() {
+        let phrase = "milk sad wage cup reward umbrella raven visa give list decorate \
+                      bulb gold raise twenty fly manual stand float super gentle climb \
+                      fold park";
+        assert_eq!(abbreviate(phrase), "milk sad … fold park");
+        // A private key has no words, so it shortens by characters instead.
+        let key = "19809c16ff7288e11bed6c8c74324aa2446f072f19809c16ff7288e11bed6c8c";
+        assert_eq!(key.len(), 64);
+        assert_eq!(abbreviate(key), "19809c16…1bed6c8c");
+        // Short enough to show whole is shown whole.
+        assert_eq!(abbreviate("abandon about"), "abandon about");
     }
 
     #[test]

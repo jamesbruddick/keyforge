@@ -511,6 +511,8 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
     let refs: Vec<&str> = fingerprint_parts.iter().map(|s| s.as_str()).collect();
     let fingerprint = State::fingerprint(&refs);
 
+    // Kept for the summary, which names the file when a run adds nothing to it.
+    let out_path = args.out.clone();
     let config = ScanConfig {
         filter: args.filter.clone(),
         corpus: args.corpus.clone(),
@@ -551,11 +553,21 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
     ui.row(
         "candidates",
         &format!(
-            "{} secrets from {} matching positions",
-            ui::commas(report.candidates),
+            "{} from {} matching positions",
+            plural(report.candidates, "new secret"),
             ui::commas(report.locations)
         ),
     );
+    // Zero new secrets out of a positive number of positions is what a resumed sweep over
+    // ground it has already covered looks like, and "0 secrets" on its own reads as
+    // "found nothing" -- which is the opposite of what happened. The secrets are in the
+    // file; the run simply had nothing to add to it.
+    if report.candidates == 0 && report.locations > 0 {
+        ui.cont(&format!(
+            "every one was already in {}, so nothing was added to it",
+            out_path.display()
+        ));
+    }
     // Should always be zero. See `ScanReport::unconfirmed`: the device is a filter and
     // the CPU is the oracle, so this counts records the two disagree about -- which is the
     // only symptom a silently-wrong kernel has.

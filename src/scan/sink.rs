@@ -129,66 +129,71 @@ impl<'a> MatchSink<'a> {
         // one -- and the counter follows the file, not the probe.
         let first = self.seen.insert(secret.clone());
 
-        // Where this came from, on one line: the vulnerability and point name the
-        // wallet, path and form name the key, and the address and hash160 are what a
-        // block explorer and the filter respectively were asked about.
-        //
-        // The point leads every announcement rather than only the first, so each one
-        // stands on its own -- another thread's find can land between two paths of the
-        // same point, and a line that reads as a continuation of something no longer
-        // above it is worse than a repeated word.
-        let headline = format!(
-            "{} {} · {}B · {} · {} · {}",
-            hit.vuln,
-            hit.point,
-            hit.location.material_len,
-            hit.location.route.as_str(),
-            hit.location.path(scope).unwrap_or_else(|| "(raw key)".into()),
-            hit.location.form.as_str(),
-        );
-        // The addresses on their own lines under it. A compressed hash160 is spendable
-        // two ways and `encode` returns both, which together with the headline and the
-        // hash160 made a single line of over 160 characters -- on the one announcement of
-        // a sweep that has to be readable. Split here rather than wrapped, because each
-        // of these is a string someone is about to paste into a block explorer and a
-        // wrapped address cannot be selected in one go.
-        let mut context: Vec<String> = address::encode(hit.location.form, hit.hash)
-            .split(" / ")
-            .map(|address| self.ui.data(address))
-            .collect();
-        // Last, and dim: it is what the filter was actually asked about, so it is the
-        // line that matters when a hit is being argued with, and noise otherwise.
-        context.push(self.ui.dim(&format!("hash160 {}", ui::hex(hit.hash))));
-
         if let Some(details) = &mut self.details {
             let _ = writeln!(details, "{}", details_line(hit, scope, &secret));
             let _ = details.flush();
         }
 
+        // Where this came from: the vulnerability and point name the wallet, the path and
+        // form name the key within it.
+        //
+        // The point leads every announcement rather than only the first, so each one
+        // stands on its own -- another thread's find can land between two paths of the
+        // same point, and a line that reads as a continuation of something no longer
+        // above it is worse than a repeated word.
+        let origin = format!(
+            "{} · {}",
+            hit.location.path(scope).unwrap_or_else(|| "(raw key)".into()),
+            hit.location.form.as_str(),
+        );
+
         if !first {
-            // A further path of a secret already announced and already written. The
-            // label carries both halves of that: it is not a `candidate`, so the blocks
-            // under that label stay equal in number to the lines in the file, and it
-            // names the secret as one already shown, which is why none is printed
-            // under it.
-            let repeat = match hit.location.route {
-                Route::Bip39 => "same phrase",
-                _ => "same key",
-            };
-            self.ui.announce(repeat, &headline, &context);
+            // A further path of a secret already announced and already written: one line,
+            // not a block. It is not a `candidate`, so the blocks under that label stay
+            // equal in number to the lines in the file -- and it is a minor event beside
+            // one, which four lines of equal weight did not say.
+            //
+            // It names the secret, shortened. It used to name only the position, on the
+            // reasoning that the secret had been printed already -- which is true of a
+            // fresh sweep and false of a resumed one, where every hit already in
+            // `matches.txt` re-derives as a repeat and the secret appeared nowhere at
+            // all. The addresses go to `--details`; the deliverable here is the secret,
+            // and a wallet importing it walks every path anyway.
+            self.ui.announce(
+                "also found",
+                &format!("{} · {origin}", self.ui.data(&ui::abbreviate(&secret))),
+                &[],
+            );
             return;
         }
 
         self.candidates += 1;
-        // The secret gets the lines under the headline to itself: it is the whole output
-        // of the sweep, it is what the triage tools want pasted into them, and at 24
-        // words it would push everything else off the edge if it shared a line. Laid out
-        // in rows of six rather than run out flat, because at 24 words it ran off the
-        // side of the terminal too -- see `ui::phrase_lines`. The file still gets the one
+        // The secret leads, because it is the whole output of the sweep and the one thing
+        // a reader is looking for; the addresses follow, because they are what a block
+        // explorer is asked about next. It used to be the other way round, which put the
+        // answer at the bottom of a block that was mostly context.
+        //
+        // Laid out in rows of six rather than run out flat -- see `ui::phrase_lines` -- a
+        // 24-word phrase being over two hundred characters. The file still gets the one
         // flat line; this is only what the reader sees.
-        let mut body = context;
-        body.extend(ui::phrase_lines(&secret).iter().map(|row| self.ui.data(row)));
-        self.ui.announce("candidate", &headline, &body);
+        let mut body: Vec<String> =
+            ui::phrase_lines(&secret).iter().map(|row| self.ui.data(row)).collect();
+        // Each address on its own line: `encode` returns both spends of a compressed
+        // hash160, and each is a string someone is about to paste into a block explorer,
+        // which a wrapped or run-together line cannot be selected as.
+        body.extend(
+            address::encode(hit.location.form, hit.hash)
+                .split(" / ")
+                .map(|address| self.ui.data(address)),
+        );
+        // Last, and dim: what the filter was actually asked about, so it is the line that
+        // matters when a hit is being argued with, and noise otherwise.
+        body.push(self.ui.dim(&format!("hash160 {}", ui::hex(hit.hash))));
+        self.ui.announce(
+            "candidate",
+            &format!("{} {} · {}B · {} · {origin}", hit.vuln, hit.point, hit.location.material_len, hit.location.route.as_str()),
+            &body,
+        );
         // Matches are rare enough that syncing on each one is free, and it means a crash
         // or a power cut never costs a candidate.
         let _ = writeln!(self.file, "{secret}");
