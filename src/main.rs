@@ -724,9 +724,9 @@ fn run_verify(ui: &Ui, args: VerifyArgs) -> Result<()> {
         // Rows of six, so a 24-word phrase is four readable lines rather than one that
         // runs off the side of the terminal.
         let rows = ui::phrase_lines(line);
-        ui.row("secret", &ui.data(&rows[0]));
+        ui.row("secret", &ui.secret(&rows[0]));
         for row in &rows[1..] {
-            ui.cont_verbatim(&ui.data(row));
+            ui.cont_verbatim(&ui.secret(row));
         }
         ui.row("type", &secret.kind());
 

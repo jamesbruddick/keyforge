@@ -161,7 +161,7 @@ impl<'a> MatchSink<'a> {
             // and a wallet importing it walks every path anyway.
             self.ui.announce(
                 "also found",
-                &format!("{} · {origin}", self.ui.data(&ui::abbreviate(&secret))),
+                &format!("{} · {origin}", self.ui.secret(&ui::abbreviate(&secret))),
                 &[],
             );
             return;
@@ -177,7 +177,7 @@ impl<'a> MatchSink<'a> {
         // 24-word phrase being over two hundred characters. The file still gets the one
         // flat line; this is only what the reader sees.
         let mut body: Vec<String> =
-            ui::phrase_lines(&secret).iter().map(|row| self.ui.data(row)).collect();
+            ui::phrase_lines(&secret).iter().map(|row| self.ui.secret(row)).collect();
         // Each address on its own line: `encode` returns both spends of a compressed
         // hash160, and each is a string someone is about to paste into a block explorer,
         // which a wrapped or run-together line cannot be selected as.

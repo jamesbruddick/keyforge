@@ -136,6 +136,39 @@ pub fn default_block(total_points: u128) -> u64 {
     ((total_points / 256).max(1)).min(4096) as u64
 }
 
+/// How many blocks a device claims at once.
+///
+/// Rounded *down*, so a claim never spans more than one full launch. It used to round up,
+/// and the extra block was pure loss: the launch loop fills `capacity` and then launches
+/// whatever is left over, so a claim of `capacity + a bit` became one full launch followed
+/// by a runt. On a 5070 Ti, with a 4,096-point block and room for 24,873 points, rounding
+/// up claimed 28,672 and every claim launched 24,873 and then 3,799.
+///
+/// A runt is not cheap in proportion to its size. `k_pbkdf2` is most of a launch's time
+/// and is latency-bound well past this size, so a launch of a seventh the points costs
+/// nearly a full launch's wall time -- which very nearly halved the device's throughput.
+///
+/// At least one, because a block larger than the device's capacity still has to be
+/// claimed whole; `launch_chunk` is what keeps that case from ending on a runt too.
+pub fn blocks_per_claim(capacity: usize, block: u64) -> u64 {
+    (capacity as u64 / block).max(1)
+}
+
+/// How many points to put in one launch, given a claim of `span` and a device that can
+/// hold `capacity`.
+///
+/// Equal launches rather than capacity-sized ones and a remainder. The two cost the same
+/// total work, and equal ones never end on a launch too small to fill the device -- which
+/// is the whole cost being avoided here. The result is at most `capacity` by construction:
+/// it is a span divided by the number of capacity-sized pieces it takes to cover it.
+pub fn launch_chunk(span: u64, capacity: usize) -> usize {
+    if span == 0 || capacity == 0 {
+        return capacity.max(1);
+    }
+    let launches = span.div_ceil(capacity as u64).max(1);
+    span.div_ceil(launches) as usize
+}
+
 /// Walk `[start, end)` of a vulnerability's space, recording filter matches.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -567,7 +600,7 @@ fn run_device<'a>(
     // which on a short range is a few hundred points and leaves the GPU almost idle: it
     // measured 297 points/s against the CPU's 946 before this existed. So the device
     // claims a contiguous *run* of blocks and launches across it.
-    let blocks_per_claim = (capacity as u64).div_ceil(block).max(1);
+    let blocks_per_claim = blocks_per_claim(capacity, block);
 
     // Two claims in flight per confirmer.
     //
@@ -673,6 +706,17 @@ fn run_device<'a>(
 
                 let mut hits = Vec::new();
                 let mut interrupted = false;
+                // Split the claim into equal launches rather than filling capacity and
+                // launching the remainder.
+                //
+                // `blocks_per_claim` keeps a claim inside one launch whenever a block
+                // fits in one, but a block larger than the device's capacity cannot be
+                // claimed in less than a whole block -- and chopping that by capacity
+                // leaves the same runt at the end. Equal launches cost the same total
+                // work and never end on one too small to fill the device. `chunk` is at
+                // most `capacity` by construction: it is a span divided by the number of
+                // capacity-sized pieces it takes to cover it.
+                let chunk = launch_chunk((hi - lo) as u64, capacity);
                 for stream in 0..streams {
                     let mut at = lo;
                     while at < hi {
@@ -680,7 +724,7 @@ fn run_device<'a>(
                             interrupted = true;
                             break;
                         }
-                        let n = ((hi - at) as usize).min(capacity);
+                        let n = ((hi - at) as usize).min(chunk);
                         for hit in gpu.run(at, n, stream)? {
                             // The record's point is an offset within *its* launch; make it
                             // an offset within the block, which is what the base says.
@@ -1090,6 +1134,65 @@ fn install_interrupt(ui: &Ui) -> Result<Arc<AtomicBool>> {
 
 #[cfg(test)]
 mod tests {
+    use super::{blocks_per_claim, default_block, launch_chunk};
+
+    /// A claim must not spill a runt launch.
+    ///
+    /// This is the regression that cost a device nearly half its throughput and had no
+    /// symptom other than a rate: `blocks_per_claim` rounded up, so every claim was one
+    /// full launch plus a fraction of one, and `k_pbkdf2` is latency-bound well past that
+    /// fraction's size -- the runt cost nearly what the full launch cost.
+    #[test]
+    fn a_claim_fits_in_one_launch() {
+        // The 5070 Ti case that surfaced it: a full 2^32 sweep's block against the
+        // capacity that card auto-sizes to.
+        let block = default_block(1u128 << 32);
+        assert_eq!(block, 4096);
+        let capacity = 24_873;
+        let span = blocks_per_claim(capacity, block) * block;
+        assert!(
+            span <= capacity as u64,
+            "a claim of {span} points does not fit one {capacity}-point launch"
+        );
+        assert_eq!(launch_chunk(span, capacity) as u64, span, "and so takes one launch");
+    }
+
+    /// The same, across the shapes a real run produces: every claim has to fit one launch
+    /// whenever a block does.
+    #[test]
+    fn no_claim_spills_a_second_launch() {
+        for capacity in [256usize, 1_250, 3_750, 24_873, 100_000] {
+            for total in [1u128 << 8, 1 << 16, 20_000, 1 << 32, 1 << 48] {
+                let block = default_block(total);
+                let span = blocks_per_claim(capacity, block) * block;
+                if block <= capacity as u64 {
+                    assert!(
+                        span <= capacity as u64,
+                        "capacity {capacity}, block {block}: claim of {span} spills"
+                    );
+                }
+                // Whether it fits or not, no launch may exceed the device.
+                assert!(launch_chunk(span, capacity) <= capacity);
+            }
+        }
+    }
+
+    /// A block bigger than the device cannot be claimed in less than a whole block, so
+    /// that span is split evenly instead of filling capacity and leaving a remainder.
+    #[test]
+    fn an_oversized_block_is_split_evenly_rather_than_leaving_a_runt() {
+        // 4,096 points through a device that holds 3,750: filling capacity would launch
+        // 3,750 and then 346.
+        assert_eq!(launch_chunk(4_096, 3_750), 2_048);
+        // Exactly one launch's worth stays one launch.
+        assert_eq!(launch_chunk(3_750, 3_750), 3_750);
+        // Just over: two even launches, not a full one and a single point.
+        assert_eq!(launch_chunk(3_751, 3_750), 1_876);
+        // Degenerate inputs do not produce a zero-point launch, which would not terminate.
+        assert!(launch_chunk(0, 3_750) > 0);
+        assert!(launch_chunk(100, 0) > 0);
+    }
+
     use super::*;
 
     /// Block size must come from the range and nothing else, so that changing `-t`

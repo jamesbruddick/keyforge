@@ -77,6 +77,18 @@ impl Color {
 const HEADLINE: Color = Color::new((0xa7, 0x8b, 0xfa), 141);
 const DATA: Color = Color::new((0xdd, 0xd6, 0xfe), 189);
 const FOUND: Color = Color::new((0xf4, 0x72, 0xb6), 205);
+/// The secret itself -- the mnemonic or the private key.
+///
+/// Its own colour because it is not the same *kind* of thing as the addresses printed
+/// under it, and in lavender it read as one more line of them. It is the output of the
+/// whole sweep; they are how you check it. Amber picks it out of a violet block at a
+/// glance without borrowing the magenta that marks the find, so a candidate reads as one
+/// labelled unit with the answer inside it rather than four interchangeable lines.
+///
+/// Warmer and lighter than `WARNING`, which is the only other warm colour it can sit
+/// near -- and it never does: a warning is a `warning`-labelled block of prose and this
+/// is only ever a value under a `candidate`.
+const SECRET: Color = Color::new((0xfc, 0xd3, 0x4d), 220);
 const NOTICE: Color = Color::new((0x22, 0xd3, 0xee), 45);
 const WARNING: Color = Color::new((0xfb, 0xbf, 0x24), 214);
 const FAILURE: Color = Color::new((0xf8, 0x71, 0x71), 210);
@@ -241,9 +253,14 @@ impl Ui {
         self.tint(&FOUND, text)
     }
 
-    /// Addresses, hashes and phrases: long strings the eye has to pick out.
+    /// Addresses and hashes: long strings the eye has to pick out.
     pub fn data(&self, text: &str) -> String {
         self.tint(&DATA, text)
+    }
+
+    /// The secret behind a find: the mnemonic or the private key.
+    pub fn secret(&self, text: &str) -> String {
+        self.tint(&SECRET, text)
     }
 
     fn line(&self, text: &str) {
