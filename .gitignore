@@ -1,0 +1,16 @@
+# Anchored with a leading slash so it means the build directory and nothing else.
+# Unanchored, `target` matches *any* directory of that name at any depth -- including
+# `src/target/`, this crate's bloom-filter module, which it silently excluded.
+/target
+
+# Scan output. Named rather than globbed: the old repo used `*.txt*` here, which also
+# ignored `assets/wordlist.txt` -- a file `bip39.rs` pulls in with `include_str!` and
+# cannot build without. It survived there only because it had been committed before the
+# rule existed, so a fresh clone of this repo would have failed to compile.
+matches.txt
+matches.jsonl
+*.state
+
+# Bloom filters. Large, built separately, never committed.
+*.bf
+*.blf
