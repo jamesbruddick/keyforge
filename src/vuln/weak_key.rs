@@ -11,7 +11,13 @@
 //! [`crate::vuln::brainwallet`], which narrows for the same reason.
 
 use crate::scan::derive::Route;
-use crate::vuln::{Defaults, Expanded, Guide, Point, Space, Vulnerability};
+use crate::vuln::{Defaults, Expanded, Guide, KernelSpec, Point, Space, Vulnerability};
+
+/// The device half of [`LowInteger::expand`].
+///
+/// Only `low-int` gets one. `repeated-byte` is 255 keys, which a device would spend
+/// longer opening than the CPU spends finishing.
+const LOW_INT_KERNEL: &str = include_str!("../../kernels/vuln/low_int.h");
 
 /// Private keys that are just small numbers: `1`, `2`, `3`, ...
 ///
@@ -84,6 +90,11 @@ impl Vulnerability for LowInteger {
         let mut key = [0u8; 32];
         key[16..].copy_from_slice(&n.to_be_bytes());
         out.push(key);
+    }
+
+    /// One stream: a point is one key, so there is no byte mapping to walk.
+    fn kernel(&self) -> Option<KernelSpec> {
+        Some(KernelSpec { source: LOW_INT_KERNEL, streams: vec![0], defines: Vec::new() })
     }
 }
 

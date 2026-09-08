@@ -1313,6 +1313,8 @@ mod tests {
     /// expected this to run.
     #[test]
     fn the_kernel_source_compiles_and_sees_its_scope() {
+        use crate::vuln::Vulnerability;
+
         // A default scope and a narrowed one: the constants differ, and a kernel that
         // only compiles for one of them is a kernel that has hard-coded something.
         for scope in [
@@ -1339,6 +1341,25 @@ mod tests {
         ] {
             match Gpu::open(&scope, &crate::vuln::mt19937::MilkSad, Batch::Fixed(64)) {
                 Ok(gpu) => println!("compiled and smoke-tested on {}", gpu.name()),
+                Err(e) if is_unavailable(&e) => {
+                    println!("skipping: {e}");
+                    return;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+
+        // `low-int`'s own scope, which is the degenerate one: no BIP39, no tree, no path,
+        // so several of the constant arrays are empty and several kernels are compiled
+        // out. A kernel set that only ever sees a seed-derived scope does not cover it.
+        let scope = {
+            let mut scope = Scope::default();
+            crate::vuln::weak_key::LowInteger.defaults().apply(&mut scope);
+            scope
+        };
+        {
+            match Gpu::open(&scope, &crate::vuln::weak_key::LowInteger, Batch::Fixed(64)) {
+                Ok(gpu) => println!("compiled low-int and smoke-tested on {}", gpu.name()),
                 Err(e) if is_unavailable(&e) => {
                     println!("skipping: {e}");
                     return;

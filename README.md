@@ -286,7 +286,7 @@ Two things follow from the filter having to be resident:
 
 Not every vulnerability has a kernel yet. `keyforge scan --gpu` says so plainly for the
 ones that do not, rather than running slower than you asked; the MT19937 family
-(`milksad`, `trust-wallet`, `php-mt`) all have one.
+(`milksad`, `trust-wallet`, `php-mt`) all have one, and so does `low-int`.
 
 ## Memory
 

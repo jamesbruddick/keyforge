@@ -96,6 +96,25 @@ KERNEL parity_mt(BUF(const u8, in, 0), BUF(u8, out, 1), CBUF(u32, n, 2) GID_PARA
     for (u32 i = 0; i < 32; i++) out[gid * 32 + i] = e[i];
 }
 
+// In: u32 point_lo, u32 point_hi, u32 stream, little-endian. Out: the 32-byte material.
+//
+// The vulnerability's own `vuln_expand`, whichever one this translation unit was
+// assembled with. Every other kernel here tests a shared primitive; this one tests the
+// single function a new vulnerability has to write, against the `expand` it mirrors.
+KERNEL parity_expand(BUF(const u8, in, 0), BUF(u8, out, 1), CBUF(u32, n, 2) GID_PARAM) {
+    GID_INIT
+    if (gid >= n) return;
+    u32 lo = 0, hi = 0, stream = 0;
+    for (u32 i = 0; i < 4; i++) {
+        lo     |= (u32)in[gid * 12 + i] << (8 * i);
+        hi     |= (u32)in[gid * 12 + 4 + i] << (8 * i);
+        stream |= (u32)in[gid * 12 + 8 + i] << (8 * i);
+    }
+    u8 e[32];
+    vuln_expand(lo, hi, stream, e);
+    for (u32 i = 0; i < 32; i++) out[gid * 32 + i] = e[i];
+}
+
 // In: one length byte then 32 entropy bytes, padded to 33. Out: two length bytes then the
 // phrase, padded to 224.
 KERNEL parity_bip39(BUF(const u8, in, 0), BUF(u8, out, 1), CBUF(u32, n, 2),

@@ -42,7 +42,17 @@ struct Harness {
 }
 
 impl Harness {
+    /// The harness the primitive tests use: the shared kernels, assembled against one
+    /// arbitrary vulnerability because they do not touch `vuln_expand`.
     fn open() -> Option<Self> {
+        Self::open_for(&crate::vuln::mt19937::MilkSad)
+    }
+
+    /// The same device, with `vuln_expand` from `v` rather than the default.
+    ///
+    /// Exactly one `vuln_expand` exists per translation unit, so testing a plugin's
+    /// kernel means assembling the source around that plugin.
+    fn open_for(v: &dyn crate::vuln::Vulnerability) -> Option<Self> {
         let serial = super::ONE_LAUNCH_AT_A_TIME
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -60,7 +70,7 @@ impl Harness {
         let layout = Layout::new(&Scope::default(), 1);
         let source = format!(
             "{}\n// ---------------- kernels/parity.h ----------------\n{}",
-            source::assemble(&layout, &crate::vuln::mt19937::MilkSad, source::dialect()),
+            source::assemble(&layout, v, source::dialect()),
             PARITY_H
         );
         // Through `gpu::compile`, not `Backend::compile`: a machine with no kernel
@@ -439,6 +449,49 @@ mod tests {
                 "seed {seed} at {} offset {offset}",
                 dist.as_str()
             );
+        }
+    }
+
+    /// `low-int`'s expansion against the host's, which is the whole of that plugin's
+    /// device half.
+    ///
+    /// The one thing this kernel can get wrong is where in the 32-byte key the point
+    /// lands, and a wrong answer there has no symptom on a device: the sweep would derive
+    /// real, valid keys that are simply not the keys the point names, and report a clean
+    /// range. So the cases are the byte and word boundaries the placement turns on, plus
+    /// the top of the space and a point above 2^32 for the carry into `point_hi`.
+    #[test]
+    fn low_int_keys_match_the_cpu() {
+        use crate::vuln::{Point, Vulnerability, weak_key::LowInteger};
+
+        let Some(mut h) = Harness::open_for(&LowInteger) else { return };
+
+        let mut points: Vec<u128> = vec![
+            1, 2, 3, 255, 256, 257, 65_535, 65_536, 16_777_215, 16_777_216,
+            // The end of the space this actually sweeps, and the two points either side
+            // of the 32-bit edge -- where the host's carry hands the device a `point_hi`.
+            0xffff_fffe, 0xffff_ffff, 0x1_0000_0000, 0x1_0000_0001,
+        ];
+        let mut rng = Rng::new(0x10ADD);
+        while points.len() < 256 {
+            points.push(rng.next_u64() as u128);
+        }
+
+        let mut input = Vec::with_capacity(points.len() * 12);
+        for p in &points {
+            input.extend_from_slice(&(*p as u32).to_le_bytes());
+            input.extend_from_slice(&((*p >> 32) as u32).to_le_bytes());
+            input.extend_from_slice(&0u32.to_le_bytes()); // the one stream
+        }
+        let out = h
+            .run("parity_expand", points.len(), &input, points.len() * 32)
+            .expect("dispatch");
+
+        for (i, p) in points.iter().enumerate() {
+            let mut want = Vec::new();
+            LowInteger.expand(Point::Integer(*p), &mut want);
+            assert_eq!(want.len(), 1, "low-int expands to one material per point");
+            assert_eq!(out[i * 32..(i + 1) * 32], want[0], "point {p}");
         }
     }
 
