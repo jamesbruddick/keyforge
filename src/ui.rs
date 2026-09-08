@@ -10,10 +10,27 @@ use std::sync::Mutex;
 
 /// Labels sit right-aligned in a gutter this wide, so every value in the run
 /// starts at the same column.
-const GUTTER: usize = 12;
+///
+/// Thirteen because that is the longest label anything prints -- `vulnerability` in the
+/// scan banner, `nothing to do` in the interrupt notices. A label wider than the gutter
+/// is not truncated, it *pushes its own value one column right*, so the one row a reader
+/// looks at first is the one row out of line with the rest of the table. Widening the
+/// gutter to the longest label is what keeps that from being a thing anyone has to
+/// remember; `every_label_fits_the_gutter` is the test that keeps it true.
+const GUTTER: usize = 13;
 
 /// Column where values begin: two-space margin, gutter, two-space separator.
 const VALUE_COL: usize = 2 + GUTTER + 2;
+
+/// Width to wrap prose to when the terminal will not say how wide it is.
+const FALLBACK_WIDTH: usize = 80;
+
+/// Prose is never wrapped wider than this even on a maximised terminal.
+///
+/// A warning is a paragraph, and a paragraph set to the full width of a 300-column
+/// window is one the eye loses its place in on every line. Typography's answer is a
+/// measure of roughly 60-90 characters and this is the top of that band.
+const MAX_MEASURE: usize = 100;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -66,7 +83,7 @@ const FAILURE: Color = Color::new((0xf8, 0x71, 0x71), 210);
 
 /// Which stream a subcommand's status lines belong on.
 ///
-/// `verify` and `bench` print a result, which belongs on stdout where it can be
+/// `vulns` and `verify` print a result, which belongs on stdout where it can be
 /// piped. `scan`'s real output is the matches file, so everything it prints is
 /// status and goes to stderr -- that keeps `scan ... 2> scan.log` a complete log
 /// and leaves stdout free.
@@ -86,6 +103,14 @@ pub struct Ui {
     /// part of the space the 256-colour cube samples coarsely, so it is worth
     /// asking rather than always settling for the nearest slot.
     truecolor: bool,
+    /// The column prose is wrapped to, measured once at startup.
+    ///
+    /// Once, not per line: a run is a single screenful of table followed by days of
+    /// findings, and re-asking the tty its width for every one of those would be a
+    /// syscall in the announce path. A terminal resized mid-sweep keeps the measure it
+    /// started with, which is the right trade -- the alternative reflows old lines
+    /// against a width they were never set to.
+    measure: usize,
     /// What is currently on the last three rows of the screen.
     ///
     /// A sweep prints two kinds of thing at once: a bar that stays put and
@@ -161,6 +186,7 @@ impl Ui {
             interactive: allowed && std::io::stderr().is_terminal(),
             truecolor: std::env::var("COLORTERM")
                 .is_ok_and(|v| v.contains("truecolor") || v.contains("24bit")),
+            measure: terminal_width().min(MAX_MEASURE),
             screen: Mutex::new(Screen::default()),
         };
         // The cursor spends a sweep parked at the end of a progress bar being
@@ -306,8 +332,7 @@ impl Ui {
     /// beginning at the shared value column.
     pub fn row(&self, label: &str, value: &str) {
         // Pad before colouring, or the escape bytes eat the field width.
-        let padded = format!("{label:>GUTTER$}");
-        self.line(&format!("  {}  {value}", self.dim(&padded)));
+        self.line(&format!("{}{value}", self.dim(&gutter(label))));
     }
 
     /// A row whose value is a headline figure.
@@ -316,13 +341,31 @@ impl Ui {
     }
 
     /// A further line belonging to the row above, aligned under its value.
+    ///
+    /// Wrapped to the terminal, because these are sentences rather than values: left to
+    /// run long they are re-wrapped by the terminal at column 0, which puts the second
+    /// half of the sentence under the gutter and breaks the table it is part of.
     pub fn cont(&self, text: &str) {
-        self.line(&format!("{}{}", " ".repeat(VALUE_COL), self.dim(text)));
+        for line in wrap(text, self.measure, VALUE_COL) {
+            self.line(&format!("{}{}", " ".repeat(VALUE_COL), self.dim(&line)));
+        }
     }
 
     /// A continuation line that is content rather than commentary, so it is not
     /// dimmed away: an address, a phrase, a hash.
     pub fn cont_plain(&self, text: &str) {
+        for line in wrap(text, self.measure, VALUE_COL) {
+            self.line(&format!("{}{line}", " ".repeat(VALUE_COL)));
+        }
+    }
+
+    /// A continuation line that is *data* -- an address, a mnemonic, a hex digest -- and
+    /// so is placed verbatim.
+    ///
+    /// Separate from `cont_plain` because wrapping is exactly wrong here: collapsing
+    /// runs of spaces would corrupt an aligned dump, and a value the reader is going to
+    /// select and copy has to survive the trip through the terminal unaltered.
+    pub fn cont_verbatim(&self, text: &str) {
         self.line(&format!("{}{text}", " ".repeat(VALUE_COL)));
     }
 
@@ -343,14 +386,13 @@ impl Ui {
     /// stream takes one -- which is what `interactive` answers, the row stream's
     /// own `color` having nothing to say about where these lines go.
     fn labelled(&self, color: &Color, bold: bool, label: &str, text: &str) -> String {
-        let padded = format!("{label:>GUTTER$}");
-        let label = if self.interactive {
+        let padded = gutter(label);
+        if self.interactive {
             let weight = if bold { BOLD } else { "" };
-            format!("{weight}{}{padded}{RESET}", self.sgr(color))
+            format!("{weight}{}{padded}{RESET}{text}", self.sgr(color))
         } else {
-            padded
-        };
-        format!("  {label}  {text}")
+            format!("{padded}{text}")
+        }
     }
 
     /// A labelled line, plus any further lines of the message aligned under it.
@@ -360,10 +402,10 @@ impl Ui {
     /// about it -- and without this the second line starts at column 0 and the
     /// table falls apart exactly where someone is trying to read it.
     fn labelled_block(&self, color: &Color, bold: bool, label: &str, text: &str) -> Vec<String> {
-        let mut rest = text.lines();
-        let first = rest.next().unwrap_or_default();
-        let mut lines = vec![self.labelled(color, bold, label, first)];
-        lines.extend(rest.map(|line| format!("{}{line}", " ".repeat(VALUE_COL))));
+        let mut wrapped = wrap(text, self.measure, VALUE_COL).into_iter();
+        let first = wrapped.next().unwrap_or_default();
+        let mut lines = vec![self.labelled(color, bold, label, &first)];
+        lines.extend(wrapped.map(|line| format!("{}{line}", " ".repeat(VALUE_COL))));
         lines
     }
 
@@ -386,8 +428,8 @@ impl Ui {
     /// with the error itself, rather than on the row stream, so a redirected run
     /// keeps the whole failure together.
     pub fn error_cause(&self, text: &str) {
-        let lines: Vec<String> = text
-            .lines()
+        let lines: Vec<String> = wrap(text, self.measure, VALUE_COL)
+            .into_iter()
             .map(|line| {
                 let body = if self.interactive {
                     format!("{DIM}{line}{RESET}")
@@ -631,6 +673,118 @@ pub fn bytes(count: u64) -> String {
     }
 }
 
+/// The margin, the label and the separator: everything to the left of a row's value.
+///
+/// Always exactly [`VALUE_COL`] columns wide, whatever the label is. That is the whole
+/// point of it being one function: every value in a run has to begin at the same column,
+/// and the way that stops being true is a label nobody measured -- `vulnerability` is
+/// thirteen characters and used to push its own value one column right, so the first row
+/// of the scan banner was the one row out of line with the table under it.
+///
+/// A label wider than the gutter is allowed to eat the left margin before it is
+/// truncated, so the alignment survives a label two characters too long rather than
+/// breaking on it.
+fn gutter(label: &str) -> String {
+    let count = label.chars().count();
+    if count <= GUTTER {
+        return format!("  {label:>GUTTER$}  ");
+    }
+    // Take what fits, counting characters: a label is not always ASCII and slicing bytes
+    // would panic rather than shorten.
+    let kept: String = label.chars().take(VALUE_COL - 2).collect();
+    format!("{kept:>width$}  ", width = VALUE_COL - 2)
+}
+
+/// How wide the terminal is, in columns.
+///
+/// Asked of the device rather than assumed, because the two failure modes are both bad
+/// and neither is silent: prose set wider than the window is re-wrapped by the terminal
+/// at column 0, which breaks out of the value column and takes the table with it, while
+/// prose set to a fixed 80 on a wide window wastes half the screen.
+///
+/// `COLUMNS` is honoured first so a caller can pin the width -- that is what the tests
+/// use, and what makes `COLUMNS=100 keyforge ... > run.log` reproduce a log at a chosen
+/// measure. Otherwise the tty is asked, and a stream that is not one has no width at all.
+#[cfg(unix)]
+pub fn terminal_width() -> usize {
+    if let Some(pinned) = std::env::var("COLUMNS").ok().and_then(|v| v.parse().ok())
+        && pinned >= MIN_WIDTH
+    {
+        return pinned;
+    }
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: `TIOCGWINSZ` writes a `winsize`, which is what is passed, and stderr is
+    // always open. A non-tty simply fails, which is the `!= 0` branch.
+    let rc = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &raw mut size) };
+    if rc == 0 && size.ws_col as usize >= MIN_WIDTH {
+        size.ws_col as usize
+    } else {
+        FALLBACK_WIDTH
+    }
+}
+
+#[cfg(not(unix))]
+pub fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&w: &usize| w >= MIN_WIDTH)
+        .unwrap_or(FALLBACK_WIDTH)
+}
+
+/// Narrower than this and the value column has no room left for words, so a reported
+/// width below it is treated as no answer at all.
+const MIN_WIDTH: usize = 40;
+
+/// Reflow prose to `width` columns, indenting every line after the first by `indent`.
+///
+/// Written for text that was authored as an indented Rust string literal, where the
+/// source's own line breaks and leading spaces are an artefact of the file rather than
+/// part of the sentence -- so all whitespace collapses and the text is set afresh.
+///
+/// A word longer than the measure is left to overhang rather than broken. The long words
+/// here are addresses, mnemonics and hex digests, and a hash160 split across two lines is
+/// one that cannot be copied, which is worse than a line that runs long.
+pub fn wrap(text: &str, width: usize, indent: usize) -> Vec<String> {
+    let measure = width.saturating_sub(indent).max(20);
+    let mut lines = Vec::new();
+    // Blank lines are paragraph breaks and are kept: the longer diagnostics are written
+    // as "here is what happened" then "here is what to do about it", and collapsing that
+    // into one block is what makes the second half easy to miss.
+    for paragraph in text.split('\n') {
+        // An indented line is pre-formatted and is passed through untouched. That is how
+        // the diagnostics spell a command to run -- the rebuild instructions under a
+        // missing GPU backend, the two forms of `keyforge verify` under an empty stdin --
+        // and reflowing one is worse than letting it run long: it collapses the alignment
+        // and can fold a command someone is about to copy across two lines.
+        if paragraph.starts_with([' ', '\t']) {
+            lines.push(paragraph.trim_end().to_string());
+            continue;
+        }
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let width_with = if current.is_empty() {
+                word.chars().count()
+            } else {
+                current.chars().count() + 1 + word.chars().count()
+            };
+            if width_with > measure && !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            } else if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        lines.push(current);
+    }
+    // A trailing blank paragraph is an artefact of a message that ends in a newline, not
+    // a line anyone meant to print.
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
 /// Lowercase hex, for hash160s.
 pub fn hex(data: &[u8]) -> String {
     use std::fmt::Write;
@@ -696,6 +850,97 @@ mod tests {
         // Nothing to do is done, and no count can exceed the whole.
         assert_eq!(percent(0, 0), 100.0);
         assert_eq!(percent(10, 5), 100.0);
+    }
+
+    /// Every value in a run has to begin at the same column, and the way that stops
+    /// being true is a label nobody measured. `vulnerability` is the longest one the
+    /// tool prints and used to be one character over, which put the first row of the
+    /// scan banner out of line with the whole table under it.
+    #[test]
+    fn every_label_fits_the_gutter() {
+        // The labels the tool actually prints, longest first.
+        for label in [
+            "vulnerability",
+            "nothing to do",
+            "interrupted",
+            "gpu scratch",
+            "hash forms",
+            "addresses",
+            "candidate",
+            "material",
+            "compiler",
+            "verified",
+            "threads",
+            "passing",
+            "routes",
+            "output",
+            "device",
+            "corpus",
+            "secret",
+            "range",
+            "paths",
+            "mode",
+            "type",
+            "cve",
+            "",
+        ] {
+            assert!(
+                label.chars().count() <= GUTTER,
+                "`{label}` is wider than the gutter, so its value would not line up"
+            );
+            assert_eq!(
+                gutter(label).chars().count(),
+                VALUE_COL,
+                "`{label}` does not put its value at the shared column"
+            );
+        }
+    }
+
+    /// And if one ever does exceed it, the column still holds: the label loses
+    /// characters rather than the table losing its alignment.
+    #[test]
+    fn an_oversized_label_never_shifts_the_value_column() {
+        assert_eq!(gutter("a label far too wide for any gutter").chars().count(), VALUE_COL);
+        // Counted in characters, not bytes: slicing this one by bytes would panic.
+        assert_eq!(gutter("★★★★★★★★★★★★★★★★★★★★★★★★").chars().count(), VALUE_COL);
+    }
+
+    /// Prose set wider than the window is re-wrapped by the terminal at column 0, which
+    /// escapes the value column and takes the table with it. So wrapping is measured
+    /// against the space a continuation line actually has, not against the whole width.
+    #[test]
+    fn prose_is_wrapped_to_the_room_a_continuation_line_has() {
+        let text = "the filter and its verification companion do not fit in RAM together, \
+                    so the scan continues with the filter alone";
+        let lines = wrap(text, 60, VALUE_COL);
+        assert!(lines.len() > 1, "this should not have fitted on one line");
+        for line in &lines {
+            assert!(
+                line.chars().count() + VALUE_COL <= 60,
+                "`{line}` runs past the terminal once it is indented"
+            );
+        }
+        // Reflowed, so the source literal's own indentation is gone.
+        assert_eq!(lines.join(" "), text.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+
+    /// A blank line separates "what happened" from "what to do about it", and the
+    /// longer diagnostics are written that way. Collapsing it is what makes the second
+    /// half easy to miss.
+    #[test]
+    fn a_paragraph_break_survives_wrapping() {
+        let lines = wrap("what happened\n\nwhat to do", 40, 0);
+        assert_eq!(lines, ["what happened", "", "what to do"]);
+        // But a message that merely ends in a newline gains no trailing blank.
+        assert_eq!(wrap("just this\n", 40, 0), ["just this"]);
+    }
+
+    /// A hash160 or a mnemonic is longer than any sensible measure, and one broken
+    /// across two lines is one that cannot be copied out of the terminal.
+    #[test]
+    fn a_word_longer_than_the_measure_overhangs_rather_than_breaking() {
+        let address = "1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA";
+        assert_eq!(wrap(address, 20, 0), [address]);
     }
 
     #[test]

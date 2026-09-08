@@ -95,7 +95,7 @@ use std::sync::LazyLock;
 /// ```sh
 /// for w in 13 14 15 16; do
 ///     KEYFORGE_EC_WINDOW=$w cargo build --release -q
-///     ./target/release/keyforge bench -f addresses.bf --seeds 4000
+///     ./target/release/keyforge scan --vuln milksad -f addresses.bf --end 4000
 /// done
 /// ```
 ///
@@ -215,8 +215,8 @@ const fn parse_window(text: &str) -> usize {
 ///
 /// ```sh
 /// for w in 18 19 20 22 24; do
-///     KEYFORGE_GPU_WINDOW=$w ./target/release/keyforge bench \
-///         -f addresses.bf --gpu only --seeds 3000000
+///     KEYFORGE_GPU_WINDOW=$w ./target/release/keyforge scan --vuln milksad \
+///         -f addresses.bf --gpu only --end 3000000
 /// done
 /// ```
 ///

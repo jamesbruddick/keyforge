@@ -12,6 +12,13 @@ fn main() {
         println!("### `{}`{}\n", v.id(), title);
         println!("{}\n", one_line(g.what));
         println!("**Affected:** {}\n", one_line(g.affected));
+        println!(
+            "**Runs on:** {}\n",
+            match v.kernel().is_some() {
+                true => "CPU, or GPU via CUDA and Metal.",
+                false => "CPU only -- this one has no device kernel.",
+            }
+        );
         println!("```\n{}\n```\n", g.command);
         println!("**Time:** {}\n", one_line(g.time));
         println!("**A hit looks like:** {}\n", one_line(g.hit));

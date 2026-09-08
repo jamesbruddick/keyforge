@@ -482,6 +482,17 @@ fn open_device(
     };
     let mut gpu = Gpu::open(scope, vuln, batch)?;
     ui.row("device", &gpu.name());
+    // Which of the two the sweep is actually in. `--gpu` and `--gpu only` differ by
+    // whether the CPU walks points of its own, which is most of the difference in the
+    // rate the bar goes on to report -- and `--gpu` alone defaulting to `both` is the
+    // kind of thing worth confirming in the banner rather than in the documentation.
+    ui.row(
+        "mode",
+        match config.gpu {
+            Some(crate::gpu::Mode::Only) => "device only; the CPU confirms what it finds",
+            _ => "device and CPU together",
+        },
+    );
     if let Some(compiler) = gpu.compiler() {
         ui.row("compiler", &compiler);
     }

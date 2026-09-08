@@ -249,41 +249,45 @@ pub fn find(name: &str) -> Option<&'static dyn Vulnerability> {
 /// The README carries the same five parts in the same order for every vulnerability, so
 /// a reader comparing two of them never has to work out which bits correspond, and
 /// `readme_documents_every_vulnerability` holds the file to it.
-pub fn render_guide(v: &dyn Vulnerability) -> String {
+pub fn render_guide(v: &dyn Vulnerability, width: usize) -> String {
     let g = v.guide();
     let mut s = String::new();
     let title = match v.cve() {
         Some(cve) => format!("{} ({cve})", v.id()),
         None => v.id().to_string(),
     };
-    s.push_str(&format!("{title}\n\n"));
-    s.push_str(&format!("What went wrong\n  {}\n\n", wrap(g.what, 2)));
-    s.push_str(&format!("Who is affected\n  {}\n\n", wrap(g.affected, 2)));
-    s.push_str(&format!("Scan it with\n  {}\n\n", g.command));
-    s.push_str(&format!("How long it takes\n  {}\n\n", wrap(g.time, 2)));
-    s.push_str(&format!("What a hit looks like\n  {}\n", wrap(g.hit, 2)));
+    s.push_str(&format!("\n{title}\n"));
+    // Whether a sweep can use a device belongs in the guide rather than only in the
+    // listing: it is half of what "how long it takes" means, and the timings below are
+    // quoted for both.
+    let engine = if v.kernel().is_some() {
+        "CPU or GPU (CUDA and Metal)"
+    } else {
+        "CPU only"
+    };
+    s.push_str(&format!("{}\n\n", indent(engine, 2)));
+
+    let mut section = |heading: &str, body: &str| {
+        s.push_str(&format!("{heading}\n{}\n\n", indent(body, 2)));
+    };
+    section("What went wrong", &wrap_at(g.what, width));
+    section("Who is affected", &wrap_at(g.affected, width));
+    section("Scan it with", g.command);
+    section("How long it takes", &wrap_at(g.time, width));
+    section("What a hit looks like", &wrap_at(g.hit, width));
     s
+}
+
+/// Indent every line of an already-wrapped block.
+fn indent(text: &str, by: usize) -> String {
+    let pad = " ".repeat(by);
+    text.lines().map(|l| format!("{pad}{l}")).collect::<Vec<_>>().join("\n")
 }
 
 /// Reflow prose that was written as an indented Rust string literal, where the source
 /// indentation is not part of the text.
-fn wrap(text: &str, indent: usize) -> String {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let mut out = String::new();
-    let mut col = indent;
-    for word in words {
-        if col + word.len() + 1 > 78 && col > indent {
-            out.push('\n');
-            out.push_str(&" ".repeat(indent));
-            col = indent;
-        } else if col > indent {
-            out.push(' ');
-            col += 1;
-        }
-        out.push_str(word);
-        col += word.len();
-    }
-    out
+fn wrap_at(text: &str, width: usize) -> String {
+    crate::ui::wrap(text, width, 2).join("\n")
 }
 
 /// Every accepted name, for an error message that lists the alternatives.

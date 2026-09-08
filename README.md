@@ -33,7 +33,12 @@ keyforge vulns                        # what can be scanned, and how
 keyforge vulns milksad                # the full guide for one
 keyforge scan --vuln milksad -f funded.bf
 keyforge scan --vuln brainwallet --corpus phrases.txt -f funded.bf
+keyforge verify < matches.txt         # the addresses behind what it found
 ```
+
+`keyforge vulns` lists each vulnerability with the size of its search space and whether
+it has a device kernel, which are the two numbers that decide how long a sweep takes.
+`keyforge <command> --help` gives the full options for one.
 
 The scope every scan uses comes from the vulnerability, and every part of it is
 overridable:
@@ -61,10 +66,39 @@ Where a hit came from — which vulnerability, which point, which derivation pat
 address form — is written to `matches.jsonl` instead, one JSON object per hit, when you
 pass `--details`. That keeps `matches.txt` doing one job.
 
+## Triage
+
+A line in `matches.txt` is a candidate. `keyforge verify` is the step that turns it into
+something you can look up:
+
+```
+keyforge verify "<phrase>"                    # the addresses behind one secret
+keyforge verify < matches.txt                 # a whole file of them
+keyforge verify --vuln milksad < matches.txt  # walking exactly what the scan walked
+keyforge verify -f funded.bf < matches.txt    # and re-testing against the filter
+```
+
+It takes either shape `matches.txt` holds — a BIP39 mnemonic or a 64-character private
+key — and works out which is which per line, so a mixed file needs no sorting. A
+mnemonic's checksum is verified before anything is derived: a mistyped phrase derives a
+perfectly valid but completely *different* wallet, and reporting those addresses as the
+ones you pasted is the one failure triage must not have.
+
+Verification re-derives through the same walk the scan used, deliberately. The question
+it answers is "what addresses does this secret imply", not "do two implementations
+agree" — so `--vuln`, `--path`, `--routes` and `--hash-forms` mean exactly what they mean
+in a scan, and naming the vulnerability makes triage walk the scope that produced the
+hit.
+
+With `-f`, each derived address goes back through the filter. Nothing passing is a
+definite answer — a bloom filter has no false negatives — so it rules a candidate out.
+Something passing is still only "probably", and chain state is the next step.
+
 ## Vulnerabilities
 
-Each section below is generated from the plugin's own guide, so it cannot drift from the
-code. `keyforge vulns <id>` prints the same words.
+Each section below is generated from the plugin's own guide by `cargo run --example
+dump_guides`, so it cannot drift from the code. `keyforge vulns <id>` prints the same
+words.
 
 ### `milksad` — CVE-2023-39910
 
@@ -72,9 +106,10 @@ code. `keyforge vulns <id>` prints the same words.
 
 **Affected:** Libbitcoin Explorer 3.0.0 to 3.6.0 and anything built on it, CVE-2023-39910. Wallets created roughly between 2016 and 2023.
 
+**Runs on:** CPU, or GPU via CUDA and Metal.
+
 ```
 keyforge scan --vuln milksad -f funded.bf
-keyforge scan --vuln brainwallet --corpus phrases.txt -f funded.bf
 ```
 
 **Time:** About 9 days on a laptop, or 9 hours on a recent NVIDIA card. Because the seed was a clock reading you can narrow it to when the tool was actually in use, which cuts that several-fold.
@@ -86,6 +121,8 @@ keyforge scan --vuln brainwallet --corpus phrases.txt -f funded.bf
 The browser build of Trust Wallet asked for randomness and got a 32-bit number, then stretched it into a wallet. Every wallet the affected versions created is one of about 4.3 billion possibilities.
 
 **Affected:** Trust Wallet Core before 3.1.1, shipped in the Trust Wallet browser extension 0.0.172 to 0.0.182, CVE-2023-31290. Wallets created between roughly July 2022 and April 2023.
+
+**Runs on:** CPU, or GPU via CUDA and Metal.
 
 ```
 keyforge scan --vuln trust-wallet -f funded.bf
@@ -101,6 +138,8 @@ PHP's mt_rand() is a predictable generator that was never meant for keys, and a 
 
 **Affected:** Any site or script generating wallets with mt_rand(). Both PHP engine modes are covered: 7.1 and later, and the older mode that `mt_srand($s, MT_RAND_PHP)` still selects. No CVE -- this is a class of mistake, not a shipped bug.
 
+**Runs on:** CPU, or GPU via CUDA and Metal.
+
 ```
 keyforge scan --vuln php-mt -f funded.bf
 ```
@@ -114,6 +153,8 @@ keyforge scan --vuln php-mt -f funded.bf
 Python's `random` module is a predictable generator meant for simulations, not keys. A script that called `random.seed(...)` with something small -- a timestamp, a process id, a counter -- and then built a wallet from it left only about 4.3 billion possibilities.
 
 **Affected:** Any script generating wallets with the `random` module rather than `secrets` or `os.urandom`. No CVE: this is a class of mistake rather than one shipped bug, so a hit tells you about one script.
+
+**Runs on:** CPU, or GPU via CUDA and Metal.
 
 ```
 keyforge scan --vuln python-random -f funded.bf
@@ -129,6 +170,8 @@ A C program that called `srandom(time(NULL))` and built a wallet from `random()`
 
 **Affected:** Any C or C++ wallet tool using rand() or random() instead of a cryptographic source. No CVE -- this is the textbook mistake rather than one shipped bug. Note glibc specifically: some other C libraries use a different rand().
 
+**Runs on:** CPU, or GPU via CUDA and Metal.
+
 ```
 keyforge scan --vuln glibc-rand -f funded.bf
 ```
@@ -142,6 +185,8 @@ keyforge scan --vuln glibc-rand -f funded.bf
 Java's built-in `Random` class is a simple, predictable generator meant for simulations, not keys. A wallet built on it -- almost always seeded from the current time in milliseconds -- can be recreated by anyone who knows roughly when it was made.
 
 **Affected:** Any Java or Android wallet tool using `java.util.Random` instead of `SecureRandom`. No CVE: it is a misuse of a correctly-working class rather than a bug in it.
+
+**Runs on:** CPU, or GPU via CUDA and Metal.
 
 ```
 keyforge scan --vuln java-random --start 1420070400000 --end 1451606400000 -f funded.bf
@@ -157,6 +202,8 @@ A brainwallet turns a passphrase you can remember into a private key by hashing 
 
 **Affected:** Any wallet created from a remembered passphrase -- the old brainwallet.org, `bitaddress.org`'s brain wallet tab, and any `sha256(phrase)` script. Not a software bug, so there is no CVE and no version to check.
 
+**Runs on:** CPU only -- this one has no device kernel.
+
 ```
 keyforge scan --vuln brainwallet --corpus phrases.txt -f funded.bf
 ```
@@ -170,6 +217,8 @@ keyforge scan --vuln brainwallet --corpus phrases.txt -f funded.bf
 Some wallets ask for 32 bytes of randomness and only get a few, leaving the rest of the buffer as zeros. The mnemonic still has the right number of words and a valid checksum, so nothing looks wrong -- but the wallet has about as much real randomness as a 32-bit number.
 
 **Affected:** No single product: this is an unchecked short read or a wrong loop bound at the point randomness is collected, and it has happened in several wallets independently. Worth running against any wallet you suspect was generated by hand-rolled code.
+
+**Runs on:** CPU, or GPU via CUDA and Metal.
 
 ```
 keyforge scan --vuln truncated-entropy -f funded.bf
@@ -185,6 +234,8 @@ Some wallets end up with a private key that is just a small number -- 1, 2, 3 an
 
 **Affected:** No single product. This is what broken randomness looks like when it fails to zero, plus the deliberately-funded puzzle addresses. Worth running first on any investigation because it is so cheap.
 
+**Runs on:** CPU, or GPU via CUDA and Metal.
+
 ```
 keyforge scan --vuln low-int --end 16777216 -f funded.bf
 ```
@@ -198,6 +249,8 @@ keyforge scan --vuln low-int --end 16777216 -f funded.bf
 A private key made of the same byte 32 times over -- all 0x01s, all 0xffs. This is what a wallet ends up with when a buffer is filled with a constant instead of randomness, which happens more often than it should.
 
 **Affected:** No single product; it is a symptom of a memory bug rather than a design mistake. There are only 255 such keys, so it is worth checking regardless.
+
+**Runs on:** CPU, or GPU via CUDA and Metal.
 
 ```
 keyforge scan --vuln repeated-byte -f funded.bf

@@ -13,8 +13,66 @@ use keyforge::wallet::address::HashForm;
 use keyforge::wallet::path::PathSpec;
 use std::path::PathBuf;
 
+/// `--gpu`'s long help, with the last paragraph filled in per build.
+///
+/// A macro because `concat!` takes literals and nothing else, and the alternative is
+/// either a formatting crate for four sentences or the same three paragraphs written out
+/// four times, once per feature combination.
+macro_rules! gpu_help {
+    ($built:literal) => {
+        concat!(
+            "Use the GPU. `both` also walks points on the CPU; `only` leaves the CPU to \
+             confirm what the device finds.\n\n\
+             The device is a filter and the CPU is the oracle: a device record only means \
+             \"look at this point\", and the host re-derives that point before anything \
+             reaches the matches file. A wrong kernel therefore cannot write a wrong \
+             secret -- but it can silently miss wallets, which is what the `unconfirmed` \
+             counter at the end of a scan is there to catch.\n\n",
+            $built
+        )
+    };
+}
+
+#[cfg(all(feature = "metal", feature = "cuda"))]
+const GPU_HELP: &str = gpu_help!("This binary has both the Metal and CUDA backends.");
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+const GPU_HELP: &str = gpu_help!("This binary has the Metal backend, for Apple GPUs.");
+#[cfg(all(feature = "cuda", not(feature = "metal")))]
+const GPU_HELP: &str =
+    gpu_help!("This binary has the CUDA backend, for NVIDIA cards (driver 580 or newer).");
+#[cfg(not(any(feature = "metal", feature = "cuda")))]
+const GPU_HELP: &str = gpu_help!(
+    "This binary has NO GPU backend compiled in, so this flag will fail. Rebuild with \
+     `--features metal` (Apple) or `--features cuda` (NVIDIA, driver 580 or newer)."
+);
+
 #[derive(Parser)]
-#[command(name = "keyforge", version, about, long_about = None)]
+#[command(
+    name = "keyforge",
+    version,
+    about,
+    long_about = "Scan Bitcoin vulnerabilities that produce guessable mnemonic phrases \
+                  or private keys.\n\n\
+                  You give it a vulnerability to sweep and a bloom filter of funded \
+                  addresses. It derives the wallets that vulnerability could have \
+                  produced, tests each against the filter, and writes out the secret \
+                  behind anything that matches.\n\n\
+                  What it writes are CANDIDATES, not confirmed funds: a bloom filter \
+                  answers \"definitely not\" exactly and \"probably yes\" approximately. \
+                  `keyforge verify` is the first triage step.",
+    after_help = "Getting started:\n  \
+        keyforge vulns                              what can be scanned, and how\n  \
+        keyforge vulns milksad                      the full guide for one\n\n\
+      Scanning:\n  \
+        keyforge scan --vuln milksad -f funded.bf   sweep a range\n  \
+        keyforge scan --vuln milksad -f funded.bf --gpu\n  \
+        keyforge scan --vuln brainwallet --corpus phrases.txt -f funded.bf\n\n\
+      Triage:\n  \
+        keyforge verify \"<phrase>\"                  addresses behind one secret\n  \
+        keyforge verify < matches.txt               a whole file of them\n\n\
+      A scan can be stopped with Ctrl-C and resumed by re-running the same command.\n\
+      Use `keyforge <command> --help` for the full options of one."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -29,6 +87,8 @@ enum Command {
         /// A vulnerability id or alias. Omit to list them all.
         name: Option<String>,
     },
+    /// Derive the addresses behind a candidate secret, so it can be looked up on chain.
+    Verify(VerifyArgs),
 }
 
 /// What to derive for each point.
@@ -78,7 +138,18 @@ impl ScopeArgs {
     fn to_scope(&self, v: &dyn Vulnerability) -> Result<Scope> {
         let mut scope = Scope::default();
         v.defaults().apply(&mut scope);
+        self.override_scope(&mut scope)?;
+        Ok(scope)
+    }
 
+    /// Apply the explicit overrides to a scope that already carries its defaults, and
+    /// check the result.
+    ///
+    /// Split out from [`to_scope`](Self::to_scope) because `verify` needs exactly this
+    /// half: its scope starts from a vulnerability's defaults *or* the scanner's, and
+    /// duplicating the parsing there is how `--path` comes to mean two different things
+    /// in two subcommands.
+    fn override_scope(&self, scope: &mut Scope) -> Result<()> {
         if let Some(sizes) = &self.material {
             for size in sizes {
                 if !keyforge::wallet::bip39::VALID_ENTROPY_SIZES.contains(size) {
@@ -122,7 +193,7 @@ impl ScopeArgs {
         }
 
         scope.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(scope)
+        Ok(())
     }
 
     /// A stable string describing everything that decides what this scan walks.
@@ -185,13 +256,62 @@ struct ScanArgs {
     /// Use the GPU. `both` also walks points on the CPU; `only` leaves the CPU to
     /// confirm what the device finds.
     #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "both",
-          hide = !cfg!(feature = "gpu"))]
+          hide = !cfg!(feature = "gpu"),
+          long_help = GPU_HELP)]
     gpu: Option<keyforge::gpu::Mode>,
 
     /// Points per device launch. Sized from the device's memory when not given.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", hide = !cfg!(feature = "gpu"))]
     gpu_batch: Option<usize>,
 }
+
+/// `verify` re-derives a secret through the same walk a scan used.
+///
+/// This is the first triage step and it is deliberately the *same code path*: a hit is
+/// only worth acting on if the addresses it implies can be reproduced, and reproducing
+/// them with a second implementation would only prove the two agree. `--vuln` is
+/// optional here, unlike in a scan -- a phrase in `matches.txt` is a phrase whether or
+/// not you still remember which sweep produced it -- and naming one just borrows its
+/// scope so triage walks exactly what the scan walked.
+#[derive(Args)]
+struct VerifyArgs {
+    /// Candidate secrets: mnemonic phrases or 64-character private keys. Reads stdin
+    /// when none are given, so `keyforge verify < matches.txt` triages a whole file.
+    #[arg(value_name = "SECRET")]
+    secrets: Vec<String>,
+
+    /// Borrow a vulnerability's derivation scope, so triage walks what the scan walked.
+    #[arg(long, value_name = "ID")]
+    vuln: Option<String>,
+
+    /// Derivation paths, repeatable. E.g. "m/44'/0'/0'/{0,1}/{0..9}".
+    #[arg(long = "path", value_name = "PATH")]
+    paths: Vec<String>,
+
+    /// How the material became keys: bip39, bip32-seed, privkey.
+    #[arg(long, value_name = "ROUTE", value_delimiter = ',')]
+    routes: Option<Vec<String>>,
+
+    /// Which hash160 forms to derive: compressed, uncompressed, p2sh-p2wpkh.
+    #[arg(long, value_name = "FORM", value_delimiter = ',')]
+    hash_forms: Option<Vec<String>>,
+
+    /// Test each derived address against a filter, and report only what it passes.
+    #[arg(short, long, value_name = "PATH")]
+    filter: Option<PathBuf>,
+
+    /// Print every address derived, not just the first few of each secret.
+    #[arg(long)]
+    all: bool,
+}
+
+/// How many addresses a secret shows before the listing is summarised.
+///
+/// A default scope derives a few hundred per secret, which is more than anyone reads and
+/// enough to bury the next secret in a file being triaged. The first few are the ones
+/// worth looking up -- receive addresses at the front of each account -- and `--all` is
+/// there for when they are not.
+const VERIFY_PREVIEW: usize = 12;
 
 fn main() -> std::process::ExitCode {
     let command = Cli::parse().command;
@@ -200,12 +320,13 @@ fn main() -> std::process::ExitCode {
     // answer, so it goes to stdout and pipes.
     let ui = Ui::new(match command {
         Command::Scan(_) => Stream::Stderr,
-        Command::Vulns { .. } => Stream::Stdout,
+        Command::Vulns { .. } | Command::Verify(_) => Stream::Stdout,
     });
 
     let result = match command {
         Command::Scan(args) => run_scan(&ui, args),
         Command::Vulns { name } => run_vulns(&ui, name),
+        Command::Verify(args) => run_verify(&ui, args),
     };
 
     match result {
@@ -302,6 +423,11 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
 
     let target = load_filter(ui, &args.filter, &scope)?;
 
+    // Any warning raised above -- a narrowed range with no time structure, a filter that
+    // cannot match a form being derived -- sits between the description and the scope
+    // table. Without this it reads as the first two rows of that table. Collapses to
+    // nothing when there were no warnings, which is the usual case.
+    ui.gap();
     ui.row("vulnerability", v.id());
     if let Some(cve) = v.cve() {
         ui.row("cve", cve);
@@ -327,9 +453,9 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
     ui.row(
         "per point",
         &format!(
-            "{} probes · {} keys · {} pbkdf2",
-            ui::commas(scope.probes_per_point()),
-            ui::commas(scope.ec_ops_per_point()),
+            "{} · {} · {} pbkdf2",
+            plural(scope.probes_per_point(), "probe"),
+            plural(scope.ec_ops_per_point(), "key"),
             ui::commas(scope.pbkdf2_per_point())
         ),
     );
@@ -415,7 +541,7 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
     if let Some(profile) = &report.gpu_profile {
         ui.gap();
         for line in profile.lines() {
-            ui.cont_plain(line);
+            ui.cont_verbatim(line);
         }
     }
     if report.unconfirmed > 0 {
@@ -433,6 +559,276 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
         ui.cont("these are candidates, not confirmed funds: check them on chain");
     }
     Ok(())
+}
+
+/// What a secret on a line of `matches.txt` turns out to be.
+///
+/// `matches.txt` holds one importable secret per line and nothing else, which is exactly
+/// the two shapes here. Telling them apart is done by looking rather than by asking the
+/// user, because the file does not record which is which and a triage run over a mixed
+/// file is the normal case.
+enum Secret {
+    /// A BIP39 mnemonic, walked as a tree.
+    Phrase(String),
+    /// 32 raw bytes, which are the key itself.
+    PrivKey([u8; 32]),
+}
+
+impl Secret {
+    /// Classify one line, or say why it is neither shape.
+    ///
+    /// The checksum is verified rather than assumed: a mistyped phrase derives a
+    /// perfectly valid but completely different wallet, and reporting its addresses as
+    /// "the addresses behind what you pasted" is the one failure triage must not have.
+    fn parse(text: &str) -> Result<Secret> {
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("empty secret");
+        }
+        // A private key is 64 hex characters. Checked first because it is unambiguous:
+        // no BIP39 phrase is a single whitespace-free 64-character hex string.
+        if text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit()) {
+            let mut bytes = [0u8; 32];
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
+                    .expect("64 hex digits parse two at a time");
+            }
+            return Ok(Secret::PrivKey(bytes));
+        }
+        let words = text.split_whitespace().count();
+        if keyforge::wallet::bip39::VALID_ENTROPY_SIZES.contains(&(words * 4 / 3))
+            && words.is_multiple_of(3)
+        {
+            if !keyforge::wallet::bip39::mnemonic_is_valid(text) {
+                bail!(
+                    "this is {words} words, but its BIP39 checksum does not check out. \
+                     That is a typo rather than a different wallet: a phrase with a bad \
+                     checksum still derives addresses, just not the ones you meant."
+                );
+            }
+            return Ok(Secret::Phrase(text.to_string()));
+        }
+        bail!(
+            "this is neither a BIP39 mnemonic (12, 15, 18, 21 or 24 words) nor a \
+             64-character hex private key. It is {words} word(s), {} characters.",
+            text.chars().count()
+        )
+    }
+
+    /// The label the report leads with.
+    fn kind(&self) -> String {
+        match self {
+            Secret::Phrase(p) => {
+                format!("BIP39 mnemonic, {} words", p.split_whitespace().count())
+            }
+            Secret::PrivKey(_) => "private key, 32 bytes".to_string(),
+        }
+    }
+}
+
+/// Re-derive candidate secrets and show the addresses behind them.
+fn run_verify(ui: &Ui, args: VerifyArgs) -> Result<()> {
+    // The scope: a vulnerability's defaults if one was named, the scanner's otherwise,
+    // then any explicit override. Built through the same `ScopeArgs` a scan uses so the
+    // two cannot drift -- a `--path` means the same thing in both.
+    let named = match &args.vuln {
+        Some(name) => Some(vuln::find(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown vulnerability `{name}`\n\navailable: {}",
+                vuln::names().join(", ")
+            )
+        })?),
+        None => None,
+    };
+    let mut scope = Scope::default();
+    if let Some(v) = named {
+        v.defaults().apply(&mut scope);
+    }
+    // A `verify` walks routes the scan's own scope may have excluded, so the overrides
+    // are applied through the same parsers rather than re-spelled here.
+    let overrides = ScopeArgs {
+        vuln: args.vuln.clone().unwrap_or_default(),
+        material: None,
+        routes: args.routes.clone(),
+        paths: args.paths.clone(),
+        hash_forms: args.hash_forms.clone(),
+    };
+    overrides.override_scope(&mut scope)?;
+
+    let target = match &args.filter {
+        Some(path) => Some(load_filter(ui, path, &scope)?),
+        None => None,
+    };
+
+    let lines = read_secrets(&args.secrets)?;
+    if lines.is_empty() {
+        bail!(
+            "no secrets to verify. Pass them as arguments, or pipe a file of them: \
+             keyforge verify < matches.txt"
+        );
+    }
+
+    ui.title(env!("CARGO_PKG_VERSION"));
+    ui.gap();
+
+    let mut deriver = keyforge::scan::derive::Deriver::new();
+    let mut bad = 0usize;
+    let mut confirmed = 0usize;
+
+    for (index, (line_no, line)) in lines.iter().enumerate() {
+        if index > 0 {
+            ui.gap();
+        }
+        let secret = match Secret::parse(line) {
+            Ok(secret) => secret,
+            Err(error) => {
+                bad += 1;
+                ui.warn(&format!("line {line_no}: {error}"));
+                continue;
+            }
+        };
+
+        ui.row("secret", &ui.data(line.trim()));
+        ui.row("type", &secret.kind());
+
+        // Every hash the scope derives, in walk order, with its path and form. Collected
+        // rather than streamed because the summary counts are what decides how much of
+        // it to print.
+        let mut found: Vec<(String, &'static str, String, bool)> = Vec::new();
+        let mut derived = 0usize;
+        {
+            let mut visit = keyforge::scan::derive::All(
+                |location: &keyforge::scan::derive::Location, hash: &[u8; 20], _: &str| {
+                    derived += 1;
+                    let hit = target.as_ref().is_some_and(|t| t.contains(hash));
+                    // With a filter, only what passes it is worth a line; without one,
+                    // the listing *is* the answer.
+                    if target.is_none() || hit {
+                        found.push((
+                            location.path(&scope).unwrap_or_else(|| "-".to_string()),
+                            location.form.as_str(),
+                            keyforge::wallet::address::encode(location.form, hash),
+                            hit,
+                        ));
+                    }
+                },
+            );
+            match &secret {
+                Secret::Phrase(phrase) => deriver.walk_phrase(phrase, &scope, &mut visit),
+                // The privkey route takes the material as the key, which is what the
+                // 32 bytes on the line are. A scope that excludes that route would derive
+                // nothing at all, so it is added rather than assumed.
+                Secret::PrivKey(key) => {
+                    let mut scope = scope.clone();
+                    scope.routes = vec![Route::PrivKey];
+                    scope.material_sizes = vec![32];
+                    deriver.walk_batch(&[*key], &scope, &mut visit);
+                }
+            }
+        }
+
+        match &target {
+            Some(_) => {
+                ui.row(
+                    "addresses",
+                    &format!("{} derived, {} passing the filter", ui::commas(derived as u64), ui::commas(found.len() as u64)),
+                );
+                if found.is_empty() {
+                    ui.cont(
+                        "the filter rules every one of them out, which is definite: a \
+                         bloom filter has no false negatives. This secret's wallets are \
+                         not in it.",
+                    );
+                } else {
+                    confirmed += 1;
+                }
+            }
+            None => ui.row("addresses", &format!("{} derived", ui::commas(derived as u64))),
+        }
+
+        let shown = if args.all { found.len() } else { found.len().min(VERIFY_PREVIEW) };
+        // The path column is sized to what is in this listing, and dropped entirely when
+        // nothing in it has a path: a raw private key is not derived from anything, and a
+        // column of `-` invites the reader to look for the meaning of the dash.
+        let paths = found[..shown].iter().any(|(p, ..)| p != "-");
+        let width = found[..shown].iter().map(|(p, ..)| p.len()).max().unwrap_or(0);
+        for (path, form, address, _) in &found[..shown] {
+            let path = if paths { format!("{path:<width$}  ") } else { String::new() };
+            ui.cont_verbatim(&format!(
+                "{path}{}  {}",
+                ui.dim(&format!("{form:<13}")),
+                ui.data(address)
+            ));
+        }
+        if found.len() > shown {
+            ui.cont(&format!(
+                "and {} more; pass --all to list them",
+                ui::commas((found.len() - shown) as u64)
+            ));
+        }
+    }
+
+    ui.gap();
+    if target.is_some() {
+        ui.row_strong(
+            "passing",
+            &format!("{} of {} secrets", ui::commas(confirmed as u64), ui::commas(lines.len() as u64)),
+        );
+        ui.cont(
+            "a filter says \"probably\", never \"yes\". Look these addresses up on chain \
+             before treating any of them as funds.",
+        );
+    } else {
+        ui.row_strong(
+            "verified",
+            &format!("{} of {} secrets", ui::commas((lines.len() - bad) as u64), ui::commas(lines.len() as u64)),
+        );
+        // Only when there is something to look up. Advising the reader to check addresses
+        // on chain after a run that derived none is the kind of line that makes a tool
+        // feel like it is not reading its own output.
+        if bad < lines.len() {
+            ui.cont("look these addresses up on chain to see whether they hold anything");
+        }
+    }
+    if bad > 0 {
+        bail!("{bad} line(s) were not a mnemonic or a private key");
+    }
+    Ok(())
+}
+
+/// The secrets to verify: the arguments, or every non-blank line of stdin.
+///
+/// Reading stdin when there are no arguments is what makes `keyforge verify < matches.txt`
+/// the whole triage step rather than a shell loop. Blank lines and `#` comments are
+/// skipped so a hand-annotated shortlist still works.
+fn read_secrets(args: &[String]) -> Result<Vec<(usize, String)>> {
+    if !args.is_empty() {
+        return Ok(args.iter().cloned().enumerate().map(|(i, s)| (i + 1, s)).collect());
+    }
+    use std::io::{BufRead, IsTerminal};
+    if std::io::stdin().is_terminal() {
+        // Waiting for input nobody is typing looks exactly like a hang.
+        // Written as concatenated pieces rather than one continued literal: the example
+        // lines have to reach the terminal with their leading indent intact, and a `\`
+        // line-continuation strips exactly that.
+        bail!(concat!(
+            "no secrets given, and stdin is a terminal.\n\n",
+            "    keyforge verify \"<phrase>\"       one secret\n",
+            "    keyforge verify < matches.txt   a whole file",
+        ));
+    }
+    let mut out = Vec::new();
+    // Numbered as the file numbers them, counting the lines that are skipped: a warning
+    // that says "line 2" has to mean the second line of the file the reader is looking
+    // at, not the second line that happened to survive the filter.
+    for (index, line) in std::io::stdin().lock().lines().enumerate() {
+        let line = line.context("reading secrets from stdin")?;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            out.push((index + 1, trimmed.to_string()));
+        }
+    }
+    Ok(out)
 }
 
 /// Total physical RAM, where the platform will say.
@@ -537,20 +933,31 @@ fn load_filter(ui: &Ui, path: &std::path::Path, scope: &Scope) -> Result<Target>
     Ok(target)
 }
 
+/// A count and its unit, with the `s` only where it belongs.
+///
+/// `1 keys` in the banner of a scan that is otherwise carefully aligned is small, and
+/// exactly the kind of small that makes a tool read as unfinished. The narrow scopes hit
+/// it constantly: `low-int` derives one key per point.
+fn plural(count: u64, unit: &str) -> String {
+    match count {
+        1 => format!("1 {unit}"),
+        n => format!("{} {unit}s", ui::commas(n)),
+    }
+}
+
 fn fmt<T>(items: &[T], show: impl Fn(&T) -> String) -> String {
     items.iter().map(show).collect::<Vec<_>>().join(", ")
 }
 
 fn run_vulns(ui: &Ui, name: Option<String>) -> Result<()> {
-    let _ = ui;
     match name {
         None => {
-            list_vulnerabilities();
+            list_vulnerabilities(ui);
             Ok(())
         }
         Some(name) => match vuln::find(&name) {
             Some(v) => {
-                print!("{}", vuln::render_guide(v));
+                print!("{}", vuln::render_guide(v, ui::terminal_width().min(88)));
                 Ok(())
             }
             None => bail!(
@@ -561,21 +968,58 @@ fn run_vulns(ui: &Ui, name: Option<String>) -> Result<()> {
     }
 }
 
-/// One line per vulnerability: the name to type, what it costs, and what it is.
+/// One line per vulnerability: the name to type, what it costs, whether a GPU can help,
+/// and what it is.
 ///
 /// The space size is shown because it is the number that decides whether a sweep is an
-/// afternoon or a fortnight, and it is the first thing worth knowing.
-fn list_vulnerabilities() {
-    let width = vuln::registry().iter().map(|v| v.id().len()).max().unwrap_or(0);
-    for v in vuln::registry() {
-        let space = match v.space().len() {
-            Some(n) if n >= 1 << 20 => format!("2^{:.0}", (n as f64).log2()),
-            Some(n) => n.to_string(),
-            None => "corpus".to_string(),
-        };
-        println!("{:<width$}  {space:>7}  {}", v.id(), summarise(v.guide().what, 62));
+/// afternoon or a fortnight, and it is the first thing worth knowing. The GPU column is
+/// shown because it is the second: it is the difference between nine days and nine hours,
+/// and finding out that the one vulnerability you picked is the one with no kernel should
+/// not require starting a sweep.
+fn list_vulnerabilities(ui: &Ui) {
+    let rows: Vec<_> = vuln::registry()
+        .iter()
+        .map(|v| {
+            let space = match v.space().len() {
+                Some(n) if n >= 1 << 20 => format!("2^{:.0}", (n as f64).log2()),
+                Some(n) => ui::commas_u128(n),
+                None => "corpus".to_string(),
+            };
+            let gpu = if v.kernel().is_some() { "gpu" } else { "cpu" };
+            (v.id(), space, gpu, v.guide().what)
+        })
+        .collect();
+
+    let id_width = rows.iter().map(|(id, ..)| id.len()).max().unwrap_or(0);
+    let space_width = rows.iter().map(|(_, s, ..)| s.len()).max().unwrap_or(0).max(5);
+    // Whatever the terminal has left after the three fixed columns and their separators
+    // goes to the summary, so a wide window shows more of each description rather than
+    // the same 62 characters with empty space beside them.
+    let used = 2 + id_width + 2 + space_width + 2 + 3 + 2;
+    let budget = ui::terminal_width().min(110).saturating_sub(used).max(24);
+
+    println!();
+    println!(
+        "  {}  {}  {}  {}",
+        ui.dim(&format!("{:<id_width$}", "vulnerability")),
+        ui.dim(&format!("{:>space_width$}", "space")),
+        ui.dim("run"),
+        ui.dim("what went wrong")
+    );
+    for (id, space, gpu, what) in &rows {
+        println!(
+            "  {}  {}  {}  {}",
+            ui.headline(&format!("{id:<id_width$}")),
+            format_args!("{space:>space_width$}"),
+            ui.dim(gpu),
+            summarise(what, budget)
+        );
     }
-    println!("\nkeyforge vulns <name>   for the full guide");
+    println!();
+    println!("  {}", ui.dim("`gpu` means the sweep has a device kernel; `cpu` means it does not."));
+    println!();
+    println!("  keyforge vulns <name>            the full guide for one");
+    println!("  keyforge scan --vuln <name> -f funded.bf");
 }
 
 /// The opening of a guide's `what`, trimmed to fit one terminal line.
