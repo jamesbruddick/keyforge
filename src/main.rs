@@ -268,8 +268,7 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
         bail!(
             "this binary was built without GPU support. Rebuild with one of:\n    \
              cargo build --release --features metal     (Apple)\n    \
-             cargo build --release --features cuda      (NVIDIA, CUDA 13.x driver)\n    \
-             cargo build --release --features cuda12    (NVIDIA, older driver)"
+             cargo build --release --features cuda      (NVIDIA, driver 580 or newer)"
         );
     }
     if args.gpu.is_some() && corpus {

@@ -36,6 +36,11 @@ impl Dialect {
     }
 }
 
+/// Enough CUDA for a host C++ compiler to parse the CUDA branch. Test-only; see the head
+/// of the file itself for what a pass proves and what it does not.
+#[cfg(test)]
+const CUDA_HOST_SHIM: &str = include_str!("../../kernels/cuda_host_shim.h");
+
 /// The headers, in the order they must be concatenated.
 ///
 /// Order is dependency order and is not incidental: `compat.h` defines the address-space
@@ -260,6 +265,90 @@ mod tests {
         assert!(src.contains("#define HAS_BIP39 0"));
         // One region: the keys with no path.
         assert!(src.contains("#define N_REGIONS 1"));
+    }
+
+    /// The CUDA branch of every kernel actually compiles.
+    ///
+    /// This is the hole the head of `kernels/compat.h` warns about, made loud. The kernels
+    /// are one source compiled as two dialects, and each compiler only ever type-checks its
+    /// own half of every `#if`: a Mac running `cargo test --features metal` compiles the
+    /// Metal branch and learns *nothing* about the CUDA branch, which is how a file NVRTC
+    /// rejects for an undeclared identifier once shipped. Nothing else in this suite closes
+    /// that gap without an NVIDIA card in the machine.
+    ///
+    /// So a host C++ compiler is asked instead, over a shim that supplies the CUDA
+    /// spellings. A pass proves the branch parses, every identifier it names is declared,
+    /// the declaration order satisfies its call graph, and the types agree. It does not
+    /// prove NVRTC accepts it, it does not check the inline PTX in `field.h` -- which is an
+    /// opaque string to any host compiler -- and it says nothing about what the code
+    /// computes. The device tests remain the only evidence of that.
+    ///
+    /// Every plugin with a kernel is checked, because `vuln_expand` is the part most likely
+    /// to be written against one dialect and never built as the other.
+    #[test]
+    fn the_cuda_dialect_compiles() {
+        use crate::vuln::Vulnerability;
+        use std::process::Command;
+
+        let Some(cxx) = host_cxx() else {
+            eprintln!("skipping: no host C++ compiler found (set KEYFORGE_CXX to one)");
+            return;
+        };
+
+        let dir = std::env::temp_dir().join("keyforge-cuda-dialect");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        for v in crate::vuln::registry() {
+            if v.kernel().is_none() {
+                continue;
+            }
+            let mut scope = Scope::default();
+            v.defaults().apply(&mut scope);
+            let source = format!(
+                "{CUDA_HOST_SHIM}\n{}",
+                assemble(&Layout::new(&scope, 1), *v, Dialect::Cuda)
+            );
+
+            let path = dir.join(format!("{}.cu", v.id()));
+            std::fs::write(&path, &source).expect("write the translation unit");
+            let out = Command::new(&cxx)
+                .args(["-x", "c++", "-std=c++17", "-fsyntax-only"])
+                // The inline PTX in `field.h` is a string a host compiler cannot read, and
+                // it warns about the operand widths it guesses. Not a finding.
+                .arg("-Wno-asm-operand-widths")
+                .arg(&path)
+                .output()
+                .expect("run the host compiler");
+            assert!(
+                out.status.success(),
+                "the CUDA branch does not compile for `{}`:\n{}\n\
+                 the translation unit is at {}",
+                v.id(),
+                String::from_utf8_lossy(&out.stderr),
+                path.display()
+            );
+        }
+    }
+
+    /// A C++ compiler to check the CUDA branch with, or `None`.
+    ///
+    /// `KEYFORGE_CXX` first, so a machine with an unusual toolchain can name one, then the
+    /// usual spellings. Absence is a skip rather than a failure, the same way the other
+    /// oracle-backed tests treat a missing binary.
+    fn host_cxx() -> Option<std::ffi::OsString> {
+        use std::process::{Command, Stdio};
+
+        let candidates = std::env::var_os("KEYFORGE_CXX")
+            .into_iter()
+            .chain(["c++", "clang++", "g++"].iter().map(std::ffi::OsString::from));
+        candidates.into_iter().find(|cxx| {
+            Command::new(cxx)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
     }
 
     /// Both dialects must be produced from the same text, differing only in which branch

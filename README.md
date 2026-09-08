@@ -241,14 +241,24 @@ layer is held against an independent oracle rather than against another run of t
 | Brainwallet hashes | CPython's `hashlib` |
 | Bloom filter | `keyscan bf-check` against a real filter |
 | Every plugin's kernel | Its own CPU `expand`, on the device, and then a full sweep against the CPU's |
+| The CUDA dialect | A host C++ compiler, on any machine, with or without a card |
 | **End to end** | **The four Milk Sad canary wallets** — real published (seed, path, address) triples that `bx` itself produced, confirmed on chain |
 
 A few oracles need an external file or binary and skip with a message when it is absent:
 `KEYFORGE_FILTER`, `KEYFORGE_KEYSCAN`, `KEYFORGE_FILTER_SOURCE`, `KEYFORGE_CORPUS`.
 
+The kernels are one source compiled as two dialects, and each compiler only ever
+type-checks its own half of every `#if` — a Mac building the Metal branch learns nothing
+about the CUDA branch, which is how a file NVRTC rejects once shipped. So a plain
+`cargo test` compiles the CUDA branch with whatever host C++ compiler it can find
+(`KEYFORGE_CXX` names one), over a shim that supplies the CUDA spellings. That proves the
+branch parses, resolves and type-checks on a machine with no NVIDIA hardware at all. It is
+not a substitute for running the device tests on a card: it does not check the inline PTX,
+and it says nothing about what the code computes.
+
 ```
 cargo test                     # everything above
-cargo test --features metal    # or --features cuda / --features cuda12
+cargo test --features metal    # or --features cuda
 ```
 
 ## Building
@@ -256,12 +266,18 @@ cargo test --features metal    # or --features cuda / --features cuda12
 ```
 cargo build --release                      # CPU only
 cargo build --release --features metal     # Apple GPUs
-cargo build --release --features cuda      # NVIDIA, CUDA 13.x driver
-cargo build --release --features cuda12    # NVIDIA, driver older than 580
+cargo build --release --features cuda      # NVIDIA, driver 580 or newer
 ```
 
 Kernels are compiled from source at run time, so no build needs a GPU toolchain and one
 binary runs on a freshly rented box.
+
+There is one CUDA feature, pinned to the latest major version, and it sets a floor: the
+**driver** must be 580 or newer, which is the first that speaks CUDA 13. `nvidia-smi`
+prints what is installed, and an older driver needs updating rather than a different
+build. An old *card* is a separate question and still works — CUDA 13 dropped Maxwell,
+Pascal and Volta, but which toolkit compiles the kernels is chosen at run time from what
+the machine has, so a GTX 1080 Ti gets the older compiler out of the same binary.
 
 ## GPU
 

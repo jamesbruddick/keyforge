@@ -22,28 +22,25 @@ default = []
 # useful message. Never enabled alone in practice; `metal` and `cuda` pull it in.
 gpu = []
 metal = ["gpu", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
-# The CUDA backend, in two flavours that differ only in the CUDA version `cudarc`'s
-# *driver* bindings are generated from. They cannot be combined -- see the note on the
-# `cudarc` dependency for why.
+# The CUDA backend.
 #
-#     cargo build --release --features cuda      CUDA 13.x driver bindings
-#     cargo build --release --features cuda12    CUDA 12.x driver bindings
+#     cargo build --release --features cuda
 #
-# **This no longer decides which toolkit compiles the kernels.** NVRTC is found and loaded
-# at run time, and the one that can generate code for the card in the machine is the one
-# that gets used -- see `gpu::cuda::nvrtc`. Either build therefore runs on either toolkit,
-# and a card that needs the older compiler needs the older *install*, not a rebuild.
+# **One CUDA version, deliberately.** The pin below is what `cudarc` generates its driver
+# bindings from, and only one can be active: cudarc gates its bindings per version, so two
+# pins define every type twice. This tracks the latest major release and nothing else --
+# supporting an older one means a second feature, a second set of filenames to search, and
+# a build matrix where the interesting failures happen in the combination nobody built.
 #
-# Which leaves the driver as the only reason to choose: `cudarc` resolves driver entry
-# points lazily, one at a time, so a 13.x build is fine on any driver new enough for the
-# handful this backend calls. Pick `cuda12` for a driver that predates CUDA 13 (before
-# 580), `cuda` otherwise.
-cuda = ["cuda-backend", "cudarc/cuda-13030"]
-cuda12 = ["cuda-backend", "cudarc/cuda-12090"]
-# Internal: everything the two flavours share, and the feature the source is gated on.
-# Not useful alone -- it pins no toolkit version, and `cudarc`'s build script then fails
-# asking for one.
-cuda-backend = ["gpu", "dep:cudarc", "dep:libloading"]
+# The cost is stated plainly rather than hidden: **this needs a driver new enough for CUDA
+# 13, which means 580 or later.** `nvidia-smi` prints the driver version. An older driver
+# needs updating, not a different build.
+#
+# This does not decide which toolkit compiles the kernels. NVRTC is found and loaded at run
+# time, and the one that can generate code for the card in the machine is the one that gets
+# used -- see `gpu::cuda::nvrtc`. A card that needs an older compiler needs the older
+# *install*, not a rebuild.
+cuda = ["gpu", "dep:cudarc", "dep:libloading", "cudarc/cuda-13030"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -69,17 +66,12 @@ objc2-foundation = { version = "0.3", optional = true }
 # `dynamic-loading` dlopens the CUDA libraries at run time instead of linking them, so this
 # builds on a machine with no CUDA at all.
 #
-# **The version is pinned by the `cuda` / `cuda12` features above, and one of them must be
-# set.** The pin does not only select API bindings -- it also decides which filenames
-# cudarc searches for, and those are versioned. A CUDA 12 install ships `libnvrtc.so.12`
-# and `nvrtc64_120_0.dll`, neither of which a build pinned to 13 ever asks for, so a
-# perfectly good install is reported as missing. Pinning low for compatibility, which is
-# the right instinct for driver symbols, is wrong here.
-#
-# Only one pin can be active: cudarc's bindings are `cfg`-gated per version, and two
-# versions define everything twice (386 errors). `build.rs` stops the build with that
-# explanation if both features are on, since by the time this crate compiles it is too
-# late to say anything.
+# **The version is pinned by the `cuda` feature above, and it must be set.** The pin does
+# not only select API bindings -- it also decides which filenames cudarc searches for, and
+# those are versioned. A CUDA 12 install ships `libnvrtc.so.12` and `nvrtc64_120_0.dll`,
+# neither of which a build pinned to 13 ever asks for, so a perfectly good install is
+# reported as missing. Pinning low for compatibility, which is the right instinct for
+# driver symbols, is wrong here.
 #
 # Two things that look like they should work and do not, both tested:
 #   * `CUDARC_CUDA_VERSION` does not override a pinned feature. It *adds* a second version

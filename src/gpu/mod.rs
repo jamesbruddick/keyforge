@@ -47,7 +47,7 @@ mod sweep;
 // Metal is preferred wherever both are compiled in, which can only be a Mac -- and a Mac
 // has no CUDA device to find. The module still has to compile in that combination, so it
 // is built and then unused.
-#[cfg(feature = "cuda-backend")]
+#[cfg(feature = "cuda")]
 #[cfg_attr(feature = "metal", allow(dead_code))]
 mod cuda;
 #[cfg(feature = "metal")]
@@ -131,7 +131,7 @@ pub struct BufferId(pub usize);
 /// Only a backend ever reads the payloads, so a build with none compiled in genuinely has
 /// no reader for them. That is the honest state of a `cargo build` with no features, not
 /// something to hide behind a blanket allow.
-#[cfg_attr(not(any(feature = "metal", feature = "cuda-backend")), allow(dead_code))]
+#[cfg_attr(not(any(feature = "metal", feature = "cuda")), allow(dead_code))]
 pub enum Arg<'a> {
     Buffer(BufferId),
     Scalar(&'a [u8]),
@@ -1247,7 +1247,7 @@ pub fn open() -> Result<Box<dyn Backend>> {
     // loader rather than as an error we could return. Unwinding out of here would abort
     // every test that merely asked whether a GPU exists, which is exactly what a machine
     // without one does.
-    #[cfg(any(feature = "metal", feature = "cuda-backend"))]
+    #[cfg(any(feature = "metal", feature = "cuda"))]
     fn guarded<T: Backend + 'static>(
         what: &str,
         open: impl FnOnce() -> Result<T> + std::panic::UnwindSafe,
@@ -1275,12 +1275,12 @@ pub fn open() -> Result<Box<dyn Backend>> {
         guarded("Metal", metal::Metal::open)
     }
 
-    #[cfg(all(feature = "cuda-backend", not(feature = "metal")))]
+    #[cfg(all(feature = "cuda", not(feature = "metal")))]
     {
         guarded("CUDA", cuda::Cuda::open)
     }
 
-    #[cfg(not(any(feature = "metal", feature = "cuda-backend")))]
+    #[cfg(not(any(feature = "metal", feature = "cuda")))]
     {
         // `NoDevice`, not a plain error: a build with no backend has no device by
         // definition, so the GPU tests skip rather than fail on a default `cargo test`.
@@ -1288,9 +1288,8 @@ pub fn open() -> Result<Box<dyn Backend>> {
             "this build has no GPU backend compiled in.\n\
              Rebuild with one:\n    \
              cargo build --release --features metal    (Apple Silicon and Intel Macs)\n    \
-             cargo build --release --features cuda     (NVIDIA, CUDA 13.x)\n    \
-             cargo build --release --features cuda12   (NVIDIA, CUDA 12.x)\n\n\
-             `nvidia-smi` reports which CUDA version to match."
+             cargo build --release --features cuda     (NVIDIA, driver 580 or newer)\n\n\
+             `nvidia-smi` reports the driver version."
                 .to_string(),
         )))
     }

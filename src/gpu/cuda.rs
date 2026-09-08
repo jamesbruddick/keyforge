@@ -20,15 +20,20 @@
 //! `libnvrtc`, which comes with the toolkit. `open` reports an absent one as an absent
 //! device, so a machine without a toolkit skips the GPU tests instead of failing them.
 //!
-//! **Which toolkit is a run-time question.** It used to be a build-time one -- `--features
-//! cuda` meant CUDA 13.x and `--features cuda12` meant 12.x, because `cudarc` derives the
-//! library filenames it searches for from the version it was compiled against. That put a
-//! decision about the machine the binary runs on into the build, and it got the important
-//! case backwards: CUDA 13 dropped Maxwell, Pascal and Volta, so on a GTX 1080 Ti the newer
-//! toolkit is the one that cannot be used. NVRTC is therefore loaded and called directly
-//! here -- see `nvrtc`, which picks the newest installed compiler that can emit code for
-//! this card. The feature now selects only `cudarc`'s driver bindings, which resolve one
-//! entry point at a time and are not version-sensitive in the way the compiler is.
+//! **Which toolkit is a run-time question.** It used to be a build-time one -- there were
+//! two features, one per CUDA major version, because `cudarc` derives the library filenames
+//! it searches for from the version it was compiled against. That put a decision about the
+//! machine the binary runs on into the build, and it got the important case backwards: CUDA
+//! 13 dropped Maxwell, Pascal and Volta, so on a GTX 1080 Ti the newer toolkit is the one
+//! that cannot be used. NVRTC is therefore loaded and called directly here -- see `nvrtc`,
+//! which picks the newest installed compiler that can emit code for this card.
+//!
+//! What is left in the feature is `cudarc`'s driver bindings, pinned to the latest major
+//! version and only that one. Those resolve one entry point at a time and are not
+//! version-sensitive the way the compiler is, so the pin costs only a driver floor -- 580,
+//! the first that speaks CUDA 13. An older driver needs updating rather than a rebuild, and
+//! an old *card* still works, because the toolkit that compiles for it is chosen at run
+//! time.
 //!
 //! **The filter is copied here, not shared.** A discrete card has its own memory and
 //! `buffer_no_copy` cannot mean what it means on unified memory, so it allocates and
