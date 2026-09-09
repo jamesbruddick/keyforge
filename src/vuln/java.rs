@@ -143,22 +143,44 @@ impl Vulnerability for JavaUtilRandom {
         true
     }
 
-    fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>) {
+    fn expand_at(&self, point: Point<'_>, offsets: &[usize], out: &mut Vec<Expanded>) {
         let Point::Integer(n) = point else {
             debug_assert!(false, "java-random does not read a corpus");
             return;
         };
-        let mut rng = JavaRandom::new(n as u64);
-        let mut material = [0u8; 32];
-        rng.next_bytes(&mut material);
-        out.push(material);
+        for &offset in offsets {
+            let mut rng = JavaRandom::new(n as u64);
+            // Through `next_bytes`, which is how a real earlier `nextBytes(byte[])` would
+            // have advanced it: whole 32-bit draws, four bytes at a time. `offset_step`
+            // is what keeps the length a multiple of that, so this consumes exactly the
+            // draws the earlier call did and no partial one.
+            if offset > 0 {
+                let mut skipped = vec![0u8; offset];
+                rng.next_bytes(&mut skipped);
+            }
+            let mut material = [0u8; 32];
+            rng.next_bytes(&mut material);
+            out.push(material);
+        }
+    }
+
+    /// `java.util.Random` hands out 32-bit draws, so only whole words are real stream
+    /// positions -- an offset between two of them names a wallet no program produced.
+    fn offset_step(&self) -> Option<usize> {
+        Some(4)
     }
 
     /// One stream. The only plugin whose kernel genuinely needs both halves of the
     /// point: the seed space is 2^48, and a millisecond window in 2015 is already past
     /// 2^32.
-    fn kernel(&self) -> Option<KernelSpec> {
-        Some(KernelSpec { source: KERNEL_SOURCE, streams: vec![0], defines: Vec::new() })
+    fn kernel_at(&self, offsets: &[usize]) -> Option<KernelSpec> {
+        // One stream, walked once per offset.
+        Some(KernelSpec {
+            source: KERNEL_SOURCE,
+            streams: vec![0; offsets.len()],
+            offsets: offsets.iter().map(|&o| o as u32).collect(),
+            defines: Vec::new(),
+        })
     }
 }
 

@@ -24,9 +24,13 @@ INLINE u32 java_next(THREAD u64* state, u32 bits) {
 }
 
 INLINE void vuln_expand(u32 point_lo, u32 point_hi, u32 stream, THREAD u8* out) {
-    (void)stream;
+    const u32 offsets[ARRAY_N(N_STREAMS)] = VULN_OFFSETS;
     u64 seed = ((u64)point_hi << 32) | (u64)point_lo;
     u64 state = (seed ^ JAVA_MULTIPLIER) & JAVA_MASK;
+    // `nextBytes` consumes one 32-bit draw per four bytes, so an earlier wallet of this
+    // many bytes cost exactly this many draws. The host holds the offset to a multiple of
+    // four -- see `JavaUtilRandom::offset_step` -- so this is always whole draws.
+    for (u32 i = 0; i < offsets[stream] / 4u; i++) java_next(&state, 32u);
     for (u32 i = 0; i < 32; i += 4) {
         u32 rnd = java_next(&state, 32u);
         for (u32 k = 0; k < 4; k++) {

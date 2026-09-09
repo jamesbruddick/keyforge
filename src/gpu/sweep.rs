@@ -31,12 +31,23 @@ fn cpu_hashes(
     stream: usize,
     range: std::ops::Range<u128>,
 ) -> Vec<(u128, [u8; 20])> {
+    cpu_hashes_at(v, scope, &[0], stream, range)
+}
+
+/// The same, for a scan drawing material further into each point's stream.
+fn cpu_hashes_at(
+    v: &dyn Vulnerability,
+    scope: &Scope,
+    offsets: &[usize],
+    stream: usize,
+    range: std::ops::Range<u128>,
+) -> Vec<(u128, [u8; 20])> {
     let mut out = Vec::new();
     let mut deriver = Deriver::new();
     let mut expanded = Vec::new();
     for point in range {
         expanded.clear();
-        v.expand(Point::Integer(point), &mut expanded);
+        v.expand_at(Point::Integer(point), offsets, &mut expanded);
         let Some(material) = expanded.get(stream).copied() else {
             continue;
         };
@@ -137,7 +148,7 @@ fn device_agrees_with_cpu(
     let target = Target::new(filter, None);
 
     let count = (points.end - points.start) as usize;
-    let mut gpu = match Gpu::open(scope, v, Batch::Fixed(count)) {
+    let mut gpu = match Gpu::open(scope, v, &[0], Batch::Fixed(count)) {
         Ok(gpu) => gpu,
         Err(e) if is_unavailable(&e) => {
             println!("skipping: {e}");
@@ -233,7 +244,7 @@ fn a_short_launch_decodes_its_points_correctly() {
     let filter = filter_of("sweep-short.bf", &planted);
     let target = Target::new(filter, None);
 
-    let mut gpu = match Gpu::open(&scope, &MilkSad, Batch::Fixed(capacity)) {
+    let mut gpu = match Gpu::open(&scope, &MilkSad, &[0], Batch::Fixed(capacity)) {
         Ok(gpu) => gpu,
         Err(e) if is_unavailable(&e) => {
             println!("skipping: {e}");
@@ -250,6 +261,67 @@ fn a_short_launch_decodes_its_points_correctly() {
 
 /// Each byte stream is a different wallet, so a launch of stream 1 must find what the CPU
 /// finds for stream 1 -- and not what it finds for stream 0.
+/// A non-zero `--offset` has to reach the device, and reach it as the same position the
+/// host drew from.
+///
+/// The stakes are asymmetric and quiet. The device is only a filter, so a kernel drawing
+/// at the wrong offset cannot write a wrong secret -- it silently *misses* every wallet
+/// at the offset that was asked for, and reports a clean pass over ground it never
+/// walked. Nothing else in the suite would notice: the tables are parallel, the counts
+/// are right, and every record that does come back confirms.
+#[test]
+fn the_device_draws_at_the_offset_it_was_given() {
+    use crate::vuln::mt19937::MilkSad;
+
+    let scope = Scope {
+        material_sizes: vec![32],
+        routes: vec![crate::scan::derive::Route::Bip39],
+        paths: vec![crate::wallet::path::PathSpec::parse("m/0/{0..1}").unwrap()],
+        forms: vec![crate::wallet::address::HashForm::Compressed],
+    };
+    let points = 0u128..64;
+    let offsets = [32usize];
+    let count = (points.end - points.start) as usize;
+
+    // Stream 0 of a one-offset scan is `libstdc++` at 32 bytes in.
+    let cpu = cpu_hashes_at(&MilkSad, &scope, &offsets, 0, points.clone());
+    let at_front = cpu_hashes_at(&MilkSad, &scope, &[0], 0, points.clone());
+    assert_ne!(cpu, at_front, "offset 32 derived the same hashes as offset 0");
+
+    let planted: Vec<[u8; 20]> =
+        cpu.iter().step_by(cpu.len() / 7 + 1).map(|(_, h)| *h).collect();
+    let want: std::collections::BTreeSet<u128> = cpu
+        .iter()
+        .filter(|(_, h)| planted.contains(h))
+        .map(|(p, _)| *p)
+        .collect();
+    assert!(want.len() > 1);
+
+    let filter = filter_of("sweep-offset.bf", &planted);
+    let target = Target::new(filter, None);
+    let mut gpu = match Gpu::open(&scope, &MilkSad, &offsets, Batch::Fixed(count)) {
+        Ok(gpu) => gpu,
+        Err(e) if is_unavailable(&e) => {
+            println!("skipping: {e}");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+    };
+    gpu.bind_filter(target.primary()).expect("bind the filter");
+
+    let hits = gpu.run(points.start, count, 0).expect("the launch runs");
+    let got: std::collections::BTreeSet<u128> =
+        hits.iter().map(|h| points.start + h.point as u128).collect();
+    assert_eq!(got, want, "the device did not draw at offset 32");
+    for hit in &hits {
+        let point = points.start + hit.point as u128;
+        assert!(
+            cpu.iter().any(|(p, h)| *p == point && h == &hit.hash),
+            "point {point} reported a hash the CPU never derived at this offset"
+        );
+    }
+}
+
 #[test]
 fn each_stream_is_swept_separately() {
     let scope = Scope {
@@ -269,7 +341,7 @@ fn each_stream_is_swept_separately() {
     let filter = filter_of("sweep-stream.bf", &planted);
     let target = Target::new(filter, None);
 
-    let mut gpu = match Gpu::open(&scope, &MilkSad, Batch::Fixed(points.end as usize)) {
+    let mut gpu = match Gpu::open(&scope, &MilkSad, &[0], Batch::Fixed(points.end as usize)) {
         Ok(gpu) => gpu,
         Err(e) if is_unavailable(&e) => {
             println!("skipping: {e}");

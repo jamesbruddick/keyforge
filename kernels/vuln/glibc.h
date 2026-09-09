@@ -36,7 +36,8 @@ INLINE u32 glibc_next_u31(THREAD u32* state, THREAD u32* f, THREAD u32* r) {
 
 INLINE void vuln_expand(u32 point_lo, u32 point_hi, u32 stream, THREAD u8* out) {
     (void)point_hi;
-    (void)stream;
+    const u32 offsets[ARRAY_N(N_STREAMS)] = VULN_OFFSETS;
+    const u32 offset = offsets[stream];
     u32 seed = (point_lo == 0u) ? 1u : point_lo;
 
     u32 state[GLIBC_DEG];
@@ -54,5 +55,8 @@ INLINE void vuln_expand(u32 point_lo, u32 point_hi, u32 stream, THREAD u8* out) 
 
     u32 f = GLIBC_SEP, r = 0u;
     for (u32 i = 0; i < GLIBC_WARMUP; i++) glibc_next_u31(state, &f, &r);
+    // An earlier wallet's bytes, drawn and thrown away: `random()` is a recurrence over
+    // its own state, so there is no position to jump to.
+    for (u32 i = 0; i < offset; i++) glibc_next_u31(state, &f, &r);
     for (u32 i = 0; i < 32; i++) out[i] = (u8)glibc_next_u31(state, &f, &r);
 }

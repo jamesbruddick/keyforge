@@ -82,7 +82,7 @@ impl Vulnerability for LowInteger {
         }
     }
 
-    fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>) {
+    fn expand_at(&self, point: Point<'_>, _offsets: &[usize], out: &mut Vec<Expanded>) {
         let Point::Integer(n) = point else {
             debug_assert!(false, "low-int does not read a corpus");
             return;
@@ -96,8 +96,15 @@ impl Vulnerability for LowInteger {
     }
 
     /// One stream: a point is one key, so there is no byte mapping to walk.
-    fn kernel(&self) -> Option<KernelSpec> {
-        Some(KernelSpec { source: LOW_INT_KERNEL, streams: vec![0], defines: Vec::new() })
+    /// No stream to offset into, so one walk at the front of it -- `offset_step` is
+    /// `None`, which is what stops `--offset` reaching here at all.
+    fn kernel_at(&self, _offsets: &[usize]) -> Option<KernelSpec> {
+        Some(KernelSpec {
+            source: LOW_INT_KERNEL,
+            streams: vec![0],
+            offsets: vec![0],
+            defines: Vec::new(),
+        })
     }
 }
 
@@ -153,7 +160,7 @@ impl Vulnerability for RepeatedByte {
         }
     }
 
-    fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>) {
+    fn expand_at(&self, point: Point<'_>, _offsets: &[usize], out: &mut Vec<Expanded>) {
         let Point::Integer(n) = point else {
             debug_assert!(false, "repeated-byte does not read a corpus");
             return;
@@ -164,10 +171,13 @@ impl Vulnerability for RepeatedByte {
     /// One stream. The whole space is 255 points, so this kernel buys nothing on the
     /// clock -- a device spends longer opening than the CPU spends finishing. It exists
     /// so that `--gpu` over a list of vulnerabilities does not stop at this one.
-    fn kernel(&self) -> Option<KernelSpec> {
+    /// No stream to offset into, so one walk at the front of it -- `offset_step` is
+    /// `None`, which is what stops `--offset` reaching here at all.
+    fn kernel_at(&self, _offsets: &[usize]) -> Option<KernelSpec> {
         Some(KernelSpec {
             source: REPEATED_BYTE_KERNEL,
             streams: vec![0],
+            offsets: vec![0],
             defines: Vec::new(),
         })
     }

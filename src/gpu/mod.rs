@@ -641,6 +641,7 @@ impl Gpu {
     pub fn open(
         scope: &crate::scan::derive::Scope,
         vuln: &dyn crate::vuln::Vulnerability,
+        offsets: &[usize],
         batch: Batch,
     ) -> Result<Self> {
         trace("Gpu::open waiting for the launch lock");
@@ -686,7 +687,7 @@ impl Gpu {
 
         compile(
             &mut *backend,
-            &source::assemble(&layout, vuln, source::dialect()),
+            &source::assemble(&layout, vuln, offsets, source::dialect()),
         )?;
 
         trace("allocating buffers");
@@ -1347,8 +1348,6 @@ mod tests {
     /// expected this to run.
     #[test]
     fn the_kernel_source_compiles_and_sees_its_scope() {
-        use crate::vuln::Vulnerability;
-
         // A default scope and a narrowed one: the constants differ, and a kernel that
         // only compiles for one of them is a kernel that has hard-coded something.
         for scope in [
@@ -1373,7 +1372,7 @@ mod tests {
                 forms: vec![crate::wallet::address::HashForm::Compressed],
             },
         ] {
-            match Gpu::open(&scope, &crate::vuln::mt19937::MilkSad, Batch::Fixed(64)) {
+            match Gpu::open(&scope, &crate::vuln::mt19937::MilkSad, &[0], Batch::Fixed(64)) {
                 Ok(gpu) => println!("compiled and smoke-tested on {}", gpu.name()),
                 Err(e) if is_unavailable(&e) => {
                     println!("skipping: {e}");
@@ -1397,7 +1396,7 @@ mod tests {
             }
             let mut scope = Scope::default();
             v.defaults().apply(&mut scope);
-            match Gpu::open(&scope, *v, Batch::Fixed(64)) {
+            match Gpu::open(&scope, *v, &[0], Batch::Fixed(64)) {
                 Ok(gpu) => println!("compiled {} and smoke-tested on {}", v.id(), gpu.name()),
                 Err(e) if is_unavailable(&e) => {
                     println!("skipping: {e}");
@@ -1417,7 +1416,7 @@ mod tests {
     #[test]
     fn the_estimate_matches_what_is_actually_allocated() {
         let scope = Scope::default();
-        let gpu = match Gpu::open(&scope, &crate::vuln::mt19937::MilkSad, Batch::Fixed(2048)) {
+        let gpu = match Gpu::open(&scope, &crate::vuln::mt19937::MilkSad, &[0], Batch::Fixed(2048)) {
             Ok(gpu) => gpu,
             Err(e) if is_unavailable(&e) => {
                 println!("skipping: {e}");

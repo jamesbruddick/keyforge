@@ -70,7 +70,7 @@ impl Harness {
         let layout = Layout::new(&Scope::default(), 1);
         let source = format!(
             "{}\n// ---------------- kernels/parity.h ----------------\n{}",
-            source::assemble(&layout, v, source::dialect()),
+            source::assemble(&layout, v, &[0], source::dialect()),
             PARITY_H
         );
         // Through `gpu::compile`, not `Backend::compile`: a machine with no kernel

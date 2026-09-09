@@ -56,6 +56,9 @@ pub struct ScanConfig {
     pub gpu: Option<crate::gpu::Mode>,
     /// Points per device launch. `None` sizes it from the device's memory.
     pub gpu_batch: Option<usize>,
+    /// Bytes into each point's generator stream to draw material at. Always at least one
+    /// entry; `[0]` is the front of the stream, which is every scan that does not ask.
+    pub offsets: Vec<usize>,
 }
 
 /// What a finished or interrupted scan reports back.
@@ -299,7 +302,7 @@ pub fn run(
                     // How many materials this vulnerability expands a point to. Asked
                     // once: it is a property of the vulnerability, not of the point.
                     expanded.clear();
-                    vuln.expand(Point::Integer(lo), &mut expanded);
+                    vuln.expand_at(Point::Integer(lo), &config.offsets, &mut expanded);
                     let streams = expanded.len().max(1);
 
                     // One pass per stream, both inside this block, so a block is still
@@ -333,7 +336,7 @@ pub fn run(
                             let base = point;
                             while point < hi && batch.len() < derive::POINTS_PER_BATCH {
                                 expanded.clear();
-                                vuln.expand(Point::Integer(point), &mut expanded);
+                                vuln.expand_at(Point::Integer(point), &config.offsets, &mut expanded);
                                 match expanded.get(stream) {
                                     Some(material) => batch.push(*material),
                                     // A vulnerability that expands some points to fewer
@@ -464,7 +467,7 @@ pub fn run(
     let sink = sink.lock().unwrap();
     Ok(ScanReport {
         points_done: points_done.load(Ordering::Relaxed),
-        streams: streams_of(vuln, config.start),
+        streams: streams_of(vuln, config.start, &config.offsets),
         gpu_profile: device.as_mut().and_then(|g| g.report()),
         unconfirmed: unconfirmed.load(Ordering::Relaxed),
         total_points,
@@ -479,9 +482,9 @@ pub fn run(
 ///
 /// Each is a separate walk of the whole pipeline, so a point costs this many. It is asked
 /// once: it is a property of the vulnerability, not of the point.
-pub fn streams_of(vuln: &dyn Vulnerability, at: u128) -> usize {
+pub fn streams_of(vuln: &dyn Vulnerability, at: u128, offsets: &[usize]) -> usize {
     let mut out = Vec::new();
-    vuln.expand(Point::Integer(at), &mut out);
+    vuln.expand_at(Point::Integer(at), offsets, &mut out);
     out.len().max(1)
 }
 
@@ -513,7 +516,7 @@ fn open_device(
             seeds_in_range: total_points.min(u64::MAX as u128) as u64,
         },
     };
-    let mut gpu = Gpu::open(scope, vuln, batch)?;
+    let mut gpu = Gpu::open(scope, vuln, &config.offsets, batch)?;
     // The device block, as one row and its detail rather than five equal rows. What the
     // card is, and whether the CPU is walking points beside it, is the part read at a
     // glance; the compiler and the launch geometry are what a slow sweep is diagnosed
@@ -589,7 +592,7 @@ fn run_device<'a>(
     block: u64,
     total_blocks: u64,
 ) -> Result<()> {
-    let streams = streams_of(vuln, config.start);
+    let streams = streams_of(vuln, config.start, &config.offsets);
     let capacity = gpu.layout().capacity;
 
     // How many blocks it takes to fill a launch.
@@ -640,7 +643,7 @@ fn run_device<'a>(
                     for (stream, offset) in wanted {
                         let point = claim.base + offset as u128;
                         expanded.clear();
-                        vuln.expand(Point::Integer(point), &mut expanded);
+                        vuln.expand_at(Point::Integer(point), &config.offsets, &mut expanded);
                         let Some(material) = expanded.get(stream).copied() else {
                             continue;
                         };
@@ -1310,6 +1313,7 @@ mod tests {
             restart: true,
             gpu: None,
             gpu_batch: None,
+            offsets: vec![0],
         };
 
         let report = run(
@@ -1435,6 +1439,7 @@ mod corpus_tests {
             restart: true,
             gpu: None,
             gpu_batch: None,
+            offsets: vec![0],
         };
 
         let fp = corpus_fingerprint(&corpus).unwrap();

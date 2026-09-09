@@ -146,9 +146,19 @@ pub struct KernelSpec {
     /// The kernel source, defining `vuln_expand(u32 lo, u32 hi, u32 stream, u8* out)`.
     pub source: &'static str,
     /// The byte streams this vulnerability walks, as codes the kernel understands. One
-    /// launch per stream, and the order must match [`Vulnerability::expand`]'s output --
+    /// launch per stream, and the order must match [`Vulnerability::expand_at`]'s output --
     /// that is how a device record maps back to the material the host re-derives.
+    ///
+    /// With offsets in play this is the *product*: one entry per (offset, stream) pair, in
+    /// the order `expand_at` emits them, so the flat index the kernel receives still names
+    /// exactly one walk.
     pub streams: Vec<u32>,
+    /// Bytes to discard from each point's generator stream before drawing material, one
+    /// per entry of `streams` and in the same order.
+    ///
+    /// Parallel to `streams` rather than a second kernel argument, because the device is
+    /// handed one flat walk index and this keeps it that way: the kernel looks both up.
+    pub offsets: Vec<u32>,
     /// Any further `#define`s the source needs.
     pub defines: Vec<(&'static str, String)>,
 }
@@ -220,16 +230,65 @@ pub trait Vulnerability: Send + Sync {
     /// `out` is a caller-owned buffer, cleared before each call, so this allocates
     /// nothing on the hot path. How the bytes are then interpreted is
     /// [`Defaults::routes`]' business, not this method's.
-    fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>);
+    fn expand_at(&self, point: Point<'_>, offsets: &[usize], out: &mut Vec<Expanded>);
+
+    /// The material a point produces at the start of its stream.
+    ///
+    /// The shorthand almost everything wants: a scan without `--offset`, every oracle
+    /// test, and every vulnerability that has no stream to skip into. Provided rather
+    /// than implemented, so a plugin writes only the general form and the two cannot
+    /// disagree.
+    fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>) {
+        self.expand_at(point, &[0], out)
+    }
+
+    /// How far into a point's generator stream material may be drawn, as the number of
+    /// bytes an offset has to be a multiple of -- or `None` when there is no stream to
+    /// skip into and `--offset` is meaningless.
+    ///
+    /// A program that drew a second wallet without re-seeding got it from further along
+    /// the same stream, so its Nth wallet is at `N * 32` bytes. That is what an offset
+    /// recovers, and it is only a coherent question for a vulnerability whose point seeds
+    /// a generator: `low-int` and `repeated-byte` have no stream, and `truncated-entropy`
+    /// is a bug at the point randomness is *collected* rather than a generator at all.
+    ///
+    /// The step is the generator's own draw width. `bx`'s twister and glibc's `random()`
+    /// hand out bytes, so any offset is a real stream position; `java.util.Random` and
+    /// CPython's `getrandbits(32)` hand out 32-bit words, so only whole words are, and an
+    /// offset between two of them names a wallet no program ever produced.
+    fn offset_step(&self) -> Option<usize> {
+        None
+    }
 
     /// This vulnerability's GPU kernel, or `None` if it runs on the CPU only.
     ///
     /// A plugin without one is not a broken plugin: writing a correct kernel is real work,
     /// and a scan that says "this one is CPU-only" is far better than one that quietly
     /// derives the wrong wallets on a device.
-    fn kernel(&self) -> Option<KernelSpec> {
+    fn kernel_at(&self, offsets: &[usize]) -> Option<KernelSpec> {
+        let _ = offsets;
         None
     }
+
+    /// The kernel for a scan that starts at the front of every stream.
+    fn kernel(&self) -> Option<KernelSpec> {
+        self.kernel_at(&[0])
+    }
+}
+
+/// Pair every offset with every stream, in the order `expand_at` emits them.
+///
+/// Offsets outermost: a point's walks are every stream at the first offset, then every
+/// stream at the second. The order is arbitrary but it is not free -- both sides have to
+/// agree, because the flat index is what maps a device record back to the material the
+/// host re-derives, and disagreeing would confirm every record against the wrong wallet.
+/// One helper, used by every plugin that takes an offset and by the kernel spec beside
+/// it, is what keeps them agreeing.
+pub fn draws(offsets: &[usize], streams: &[u32]) -> Vec<(usize, u32)> {
+    offsets
+        .iter()
+        .flat_map(|&offset| streams.iter().map(move |&stream| (offset, stream)))
+        .collect()
 }
 
 /// Every vulnerability the binary knows about.
@@ -410,6 +469,104 @@ mod tests {
             assert!(!class.is_empty(), "{} has no classification", v.id());
             if let Some(cve) = v.cve() {
                 assert_eq!(class, cve, "{} classifies itself as neither its CVE nor none", v.id());
+            }
+        }
+    }
+
+    /// An offset has to actually move the draw, and to multiply the walks a point takes.
+    ///
+    /// The failure this catches is the quiet one: a plugin that accepts `--offset`,
+    /// reports the extra walks, costs the sweep three times as long, and derives the same
+    /// wallet three times because the offset never reached its generator.
+    #[test]
+    fn an_offset_moves_every_generator_that_accepts_one() {
+        for v in registry() {
+            let Some(step) = v.offset_step() else {
+                continue;
+            };
+            assert!(step > 0, "{}: an offset step of zero", v.id());
+            let point = sample_point(*v);
+
+            let mut front = Vec::new();
+            v.expand_at(point, &[0], &mut front);
+            let mut both = Vec::new();
+            v.expand_at(point, &[0, 32], &mut both);
+
+            // One walk per (offset, stream): twice the offsets, twice the walks.
+            assert_eq!(
+                both.len(),
+                front.len() * 2,
+                "{}: an extra offset did not add a walk",
+                v.id()
+            );
+            // The first offset's walks come first and are unchanged by asking for more.
+            assert_eq!(&both[..front.len()], &front[..], "{}: offset order moved", v.id());
+            // And the second offset's are different wallets, which is the whole point.
+            for (a, b) in front.iter().zip(&both[front.len()..]) {
+                assert_ne!(a, b, "{}: offset 32 derived the same material", v.id());
+            }
+        }
+    }
+
+    /// The offset is a position in the stream, so material at 32 is what a generator
+    /// hands out once 32 bytes have already been taken -- not a re-seed, not a skip.
+    #[test]
+    fn an_offset_names_a_position_in_the_stream() {
+        for v in registry() {
+            // Byte-wise generators only: where a draw is 32 bits, "the byte at 32" and
+            // "the 9th draw" are the same place, which this identity would not show.
+            if v.offset_step() != Some(1) {
+                continue;
+            }
+            let point = sample_point(*v);
+            let mut at_zero = Vec::new();
+            v.expand_at(point, &[0], &mut at_zero);
+            let mut at_32 = Vec::new();
+            v.expand_at(point, &[32], &mut at_32);
+            // 32 bytes of material, so offset 32 is exactly one wallet further on and
+            // cannot share a byte with the first unless the generator stalled.
+            for (a, b) in at_zero.iter().zip(&at_32) {
+                assert_ne!(a, b, "{}", v.id());
+            }
+        }
+    }
+
+    /// A kernel's two tables are read by one flat index, so they must stay parallel and
+    /// must grow with the offsets the host asked for. A short table is an out-of-bounds
+    /// read on the device.
+    #[test]
+    fn a_kernels_stream_and_offset_tables_stay_parallel() {
+        for v in registry() {
+            let offsets: &[usize] = match v.offset_step() {
+                Some(1) => &[0, 32, 64],
+                Some(_) => &[0, 32],
+                None => &[0],
+            };
+            let Some(spec) = v.kernel_at(offsets) else {
+                continue;
+            };
+            assert_eq!(
+                spec.streams.len(),
+                spec.offsets.len(),
+                "{}: stream and offset tables differ in length",
+                v.id()
+            );
+            // One entry per walk the CPU will expand to, or a device record maps back to
+            // the wrong material.
+            let mut expanded = Vec::new();
+            v.expand_at(sample_point(*v), offsets, &mut expanded);
+            assert_eq!(
+                spec.streams.len(),
+                expanded.len(),
+                "{}: the kernel walks a different number of streams than `expand_at`",
+                v.id()
+            );
+            if v.offset_step().is_some() {
+                assert!(
+                    spec.offsets.iter().any(|&o| o != 0),
+                    "{}: the offsets never reached the kernel table",
+                    v.id()
+                );
             }
         }
     }

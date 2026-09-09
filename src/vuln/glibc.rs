@@ -165,22 +165,41 @@ impl Vulnerability for GlibcRand {
         true
     }
 
-    fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>) {
+    fn expand_at(&self, point: Point<'_>, offsets: &[usize], out: &mut Vec<Expanded>) {
         let Point::Integer(n) = point else {
             debug_assert!(false, "glibc-rand does not read a corpus");
             return;
         };
-        let mut rng = GlibcRandom::new(n as u32);
-        let mut material = [0u8; 32];
-        for byte in &mut material {
-            *byte = rng.next_byte();
+        for &offset in offsets {
+            let mut rng = GlibcRandom::new(n as u32);
+            // Drawn and discarded rather than skipped over, so the prefix costs the
+            // generator exactly what a real earlier wallet cost it. `random()` is a
+            // recurrence over its own state -- there is no closed form to jump to.
+            for _ in 0..offset {
+                rng.next_byte();
+            }
+            let mut material = [0u8; 32];
+            for byte in &mut material {
+                *byte = rng.next_byte();
+            }
+            out.push(material);
         }
-        out.push(material);
+    }
+
+    /// `random()` hands out one byte at a time here, so any offset is a real position.
+    fn offset_step(&self) -> Option<usize> {
+        Some(1)
     }
 
     /// One stream: the low byte of each output, which is the mapping this plugin models.
-    fn kernel(&self) -> Option<KernelSpec> {
-        Some(KernelSpec { source: KERNEL_SOURCE, streams: vec![0], defines: Vec::new() })
+    fn kernel_at(&self, offsets: &[usize]) -> Option<KernelSpec> {
+        // One stream, walked once per offset.
+        Some(KernelSpec {
+            source: KERNEL_SOURCE,
+            streams: vec![0; offsets.len()],
+            offsets: offsets.iter().map(|&o| o as u32).collect(),
+            defines: Vec::new(),
+        })
     }
 }
 

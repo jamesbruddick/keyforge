@@ -82,7 +82,7 @@ impl Vulnerability for Brainwallet {
         }
     }
 
-    fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>) {
+    fn expand_at(&self, point: Point<'_>, _offsets: &[usize], out: &mut Vec<Expanded>) {
         let Point::Input(passphrase) = point else {
             debug_assert!(false, "brainwallet walks a corpus, not an integer range");
             return;

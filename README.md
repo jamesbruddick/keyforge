@@ -56,6 +56,32 @@ Any scan can be stopped with Ctrl-C and resumed later by re-running the same com
 Progress is checkpointed every ten seconds; an interrupted block is rescanned rather
 than skipped, so a resumed sweep never has a hole in it.
 
+## Offsets
+
+A program that made a *second* wallet without re-seeding drew it from further along the
+same generator stream, so its Nth wallet sits at `N * 32` bytes. `--offset` walks there:
+
+```
+keyforge scan --vuln milksad -f funded.bf --offset 32        # the second wallet
+keyforge scan --vuln milksad -f funded.bf --offset 0,32,64   # the first three
+```
+
+Every point is walked once per offset, so the list multiplies the sweep — three offsets
+is three passes of the range. The banner says so, and counts the walks separately from
+the points.
+
+It applies to the vulnerabilities whose point seeds a generator: `milksad`,
+`trust-wallet`, `php-mt`, `python-random`, `glibc-rand` and `java-random`. `low-int`,
+`repeated-byte`, `truncated-entropy` and `brainwallet` have no stream to skip into and
+say so rather than accepting the flag and ignoring it.
+
+The offset is in **bytes of drawn material**, and the skipped prefix is drawn rather than
+jumped over — these are recurrences over their own state, and under libstdc++ the byte
+draw rejects, so how far the generator has advanced depends on what came out of it. Where
+a generator hands out 32-bit words rather than bytes — `java.util.Random` and CPython's
+`getrandbits(32)` — only whole words are positions it can have stopped at, and an offset
+between two of them is refused rather than quietly rounded.
+
 ## Output
 
 `matches.txt` holds **one importable secret per line and nothing else** — either a BIP39

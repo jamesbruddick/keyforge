@@ -13,9 +13,12 @@
 
 INLINE void vuln_expand(u32 point_lo, u32 point_hi, u32 stream, THREAD u8* out) {
     (void)point_hi;
-    (void)stream;
+    const u32 offsets[ARRAY_N(N_STREAMS)] = VULN_OFFSETS;
     Mt19937 m;
     mt_seed_by_array(&m, point_lo);
+    // One `getrandbits(32)` per four bytes an earlier wallet took. Held to a multiple of
+    // four by `PythonRandom::offset_step`, so this is always whole draws.
+    for (u32 i = 0; i < offsets[stream] / 4u; i++) mt_next_u32(&m);
     for (u32 i = 0; i < 32; i += 4) {
         u32 word = mt_next_u32(&m);
         for (u32 k = 0; k < 4; k++) {

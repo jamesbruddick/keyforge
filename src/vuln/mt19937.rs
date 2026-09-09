@@ -651,10 +651,12 @@ use crate::vuln::{Defaults, Expanded, Guide, KernelSpec, Point, Space, Vulnerabi
 /// The device half of `expand_seed`, shared by all three products.
 const KERNEL_SOURCE: &str = include_str!("../../kernels/vuln/mt19937.h");
 
-fn kernel_for(dists: &[Dist]) -> Option<KernelSpec> {
+fn kernel_for(dists: &[Dist], offsets: &[usize]) -> Option<KernelSpec> {
+    let draws = draws_of(dists, offsets);
     Some(KernelSpec {
         source: KERNEL_SOURCE,
-        streams: dists.iter().map(|d| d.code()).collect(),
+        streams: draws.iter().map(|(_, d)| d.code()).collect(),
+        offsets: draws.iter().map(|(o, _)| *o as u32).collect(),
         defines: Vec::new(),
     })
 }
@@ -668,16 +670,27 @@ const SEED_SPACE: Space = Space::Integers { start: 0, end: 1 << 32 };
 /// for the same point rather than separate passes over the range. The order is fixed
 /// and is the order `dists` lists them in, which is what lets a caller map a material
 /// back to the stream that produced it.
-fn expand_seed(dists: &[Dist], point: Point<'_>, out: &mut Vec<Expanded>) {
+fn expand_seed(dists: &[Dist], point: Point<'_>, offsets: &[usize], out: &mut Vec<Expanded>) {
     let Point::Integer(n) = point else {
         // These spaces are integer ranges; a corpus point cannot reach here.
         debug_assert!(false, "mt19937 vulnerabilities do not read a corpus");
         return;
     };
     let seed = n as u32;
-    for &dist in dists {
-        out.push(entropy_for_seed_at(seed, Draw::new(dist, 0)));
+    // Offsets outermost, matching `vuln::draws` -- which is what `kernel_for_at` builds
+    // the device's stream table from, so the flat index means the same thing on both
+    // sides. `draws_of` is the one place that pairing is written.
+    for (offset, dist) in draws_of(dists, offsets) {
+        out.push(entropy_for_seed_at(seed, Draw::new(dist, offset)));
     }
+}
+
+/// Every walk one point takes: each stream at each offset, in `vuln::draws` order.
+fn draws_of(dists: &[Dist], offsets: &[usize]) -> Vec<(usize, Dist)> {
+    offsets
+        .iter()
+        .flat_map(|&offset| dists.iter().map(move |&dist| (offset, dist)))
+        .collect()
 }
 
 /// Libbitcoin Explorer's `bx seed` -- Milk Sad, CVE-2023-39910.
@@ -751,12 +764,17 @@ impl Vulnerability for MilkSad {
         true
     }
 
-    fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>) {
-        expand_seed(&[Dist::Libstdcxx, Dist::Libcxx], point, out)
+    fn expand_at(&self, point: Point<'_>, offsets: &[usize], out: &mut Vec<Expanded>) {
+        expand_seed(&[Dist::Libstdcxx, Dist::Libcxx], point, offsets, out)
     }
 
-    fn kernel(&self) -> Option<KernelSpec> {
-        kernel_for(&[Dist::Libstdcxx, Dist::Libcxx])
+    /// `bx seed` drew bytes, so any offset is a real position in the stream.
+    fn offset_step(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn kernel_at(&self, offsets: &[usize]) -> Option<KernelSpec> {
+        kernel_for(&[Dist::Libstdcxx, Dist::Libcxx], offsets)
     }
 }
 
@@ -826,12 +844,18 @@ impl Vulnerability for TrustWallet {
         }
     }
 
-    fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>) {
-        expand_seed(&[Dist::Libcxx], point, out)
+    fn expand_at(&self, point: Point<'_>, offsets: &[usize], out: &mut Vec<Expanded>) {
+        expand_seed(&[Dist::Libcxx], point, offsets, out)
     }
 
-    fn kernel(&self) -> Option<KernelSpec> {
-        kernel_for(&[Dist::Libcxx])
+    /// The extension filled its buffer a byte at a time, so any offset is a real
+    /// position -- though a wallet past the first means the page made more than one.
+    fn offset_step(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn kernel_at(&self, offsets: &[usize]) -> Option<KernelSpec> {
+        kernel_for(&[Dist::Libcxx], offsets)
     }
 }
 
@@ -902,15 +926,21 @@ impl Vulnerability for PhpMt {
         }
     }
 
-    fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>) {
+    fn expand_at(&self, point: Point<'_>, offsets: &[usize], out: &mut Vec<Expanded>) {
         // PHP changed the default engine mode in 7.1 and a generator page carries no
         // version, so both eras are in scope -- and the modern one is `Libcxx` rather
         // than a stream of its own precisely because it *is* that stream.
-        expand_seed(&[Dist::Libcxx, Dist::Php], point, out)
+        expand_seed(&[Dist::Libcxx, Dist::Php], point, offsets, out)
     }
 
-    fn kernel(&self) -> Option<KernelSpec> {
-        kernel_for(&[Dist::Libcxx, Dist::Php])
+    /// `mt_rand()` is drawn a byte at a time in both engine modes, so any offset is a
+    /// real position in the stream.
+    fn offset_step(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn kernel_at(&self, offsets: &[usize]) -> Option<KernelSpec> {
+        kernel_for(&[Dist::Libcxx, Dist::Php], offsets)
     }
 }
 

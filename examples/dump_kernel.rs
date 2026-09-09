@@ -40,5 +40,5 @@ fn main() {
     // what a scan of this vulnerability compiles is a dump of the wrong kernel set.
     let mut scope = Scope::default();
     vuln.defaults().apply(&mut scope);
-    print!("{}", assemble(&Layout::new(&scope, 1), vuln, dialect));
+    print!("{}", assemble(&Layout::new(&scope, 1), vuln, &[0], dialect));
 }

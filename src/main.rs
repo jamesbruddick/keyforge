@@ -78,6 +78,10 @@ struct Cli {
     command: Command,
 }
 
+// One of these is built once, at startup, and destructured immediately. Boxing the large
+// variant to even the sizes would buy an allocation and a fight with clap's derive, which
+// wants an `Args` type rather than a `Box` of one, in exchange for nothing measurable.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Sweep a vulnerability's search space against a bloom filter of funded addresses.
@@ -118,7 +122,24 @@ struct ScopeArgs {
     /// Which hash160 forms to derive: compressed, uncompressed, p2sh-p2wpkh.
     #[arg(long, value_name = "FORM", value_delimiter = ',')]
     hash_forms: Option<Vec<String>>,
+
+    /// Bytes to skip in each point's generator stream before drawing material.
+    ///
+    /// A program that made a second wallet without re-seeding drew it from further along
+    /// the same stream, so its Nth wallet is at N*32. Takes a list, and every point is
+    /// walked once per offset: `--offset 0,32,64` covers the first three wallets of every
+    /// seeding in one pass, at three times the cost.
+    #[arg(long, value_name = "BYTES", value_delimiter = ',')]
+    offset: Option<Vec<usize>>,
 }
+
+/// The largest offset worth accepting: 4,096 wallets of 32-byte material from one
+/// seeding.
+///
+/// Every skipped byte is drawn through the generator for every point, so an offset is not
+/// free -- it is a linear cost on the whole sweep. The cap is there to catch the unit
+/// being misread (an offset in wallets, or in bits) before it costs a day.
+const MAX_OFFSET: usize = 4096 * 32;
 
 impl ScopeArgs {
     fn vulnerability(&self) -> Result<&'static dyn Vulnerability> {
@@ -196,6 +217,53 @@ impl ScopeArgs {
         Ok(())
     }
 
+    /// The stream offsets to walk every point at, checked against what the vulnerability
+    /// can actually mean by one.
+    ///
+    /// Repeats are dropped rather than walked twice: a duplicate offset derives the same
+    /// wallet again and costs a full pass of the range to do it.
+    fn offsets(&self, v: &dyn Vulnerability) -> Result<Vec<usize>> {
+        let Some(asked) = &self.offset else {
+            return Ok(vec![0]);
+        };
+        let Some(step) = v.offset_step() else {
+            bail!(
+                "`{}` has no generator stream to offset into, so --offset means nothing \
+                 here. It applies to a vulnerability whose point seeds a generator, where \
+                 a second wallet drawn without re-seeding came from further along the \
+                 same stream.",
+                v.id()
+            );
+        };
+        let mut out = Vec::new();
+        for &offset in asked {
+            if offset > MAX_OFFSET {
+                bail!(
+                    "--offset {offset} is implausibly far into the stream (the cap is \
+                     {MAX_OFFSET}, i.e. {} wallets of 32-byte material). The offset is in \
+                     bytes, not wallets.",
+                    MAX_OFFSET / 32
+                );
+            }
+            if !offset.is_multiple_of(step) {
+                bail!(
+                    "--offset {offset} is not a whole number of `{}` draws. That \
+                     generator hands out {step} bytes at a time, so only multiples of \
+                     {step} are positions it can actually have stopped at -- an offset \
+                     between two draws names a wallet no program produced.",
+                    v.id()
+                );
+            }
+            if !out.contains(&offset) {
+                out.push(offset);
+            }
+        }
+        if out.is_empty() {
+            bail!("--offset was given no values");
+        }
+        Ok(out)
+    }
+
     /// A stable string describing everything that decides what this scan walks.
     ///
     /// Resuming with any of it changed is refused, because the resulting file would
@@ -208,6 +276,17 @@ impl ScopeArgs {
         parts.push(scope.routes.iter().map(|r| r.as_str()).collect::<Vec<_>>().join(","));
         parts.push(scope.paths.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" "));
         parts.push(scope.forms.iter().map(|f| f.as_str()).collect::<Vec<_>>().join(","));
+        // A resumed run with different offsets would describe a complete sweep of neither
+        // set, exactly as a changed route list would.
+        parts.push(
+            self.offset
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .map(|o| o.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
         parts
     }
 }
@@ -396,6 +475,8 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
         bail!("a corpus is walked on the CPU; drop --gpu");
     }
 
+    let offsets = args.scope.offsets(v)?;
+
     let threads = args.threads.unwrap_or_else(|| {
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
     });
@@ -449,7 +530,7 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
     // Named because it multiplies the work per point, and because a rate counted per
     // point and one counted per walk differ by exactly this factor -- which is an easy
     // way to think a sweep is slower than it is.
-    let streams = keyforge::scan::engine::streams_of(v, start);
+    let streams = keyforge::scan::engine::streams_of(v, start, &offsets);
     let streams_note = match streams {
         1 => String::new(),
         n => format!("{n} streams, each walked in full · "),
@@ -461,6 +542,16 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
         plural(scope.ec_ops_per_point(), "key"),
         ui::commas(scope.pbkdf2_per_point()),
     ));
+    if offsets != [0] {
+        ui.row(
+            "offsets",
+            &format!(
+                "{} bytes into each stream",
+                fmt(&offsets, |o| o.to_string())
+            ),
+        );
+        ui.cont("each point is walked once per offset, so this multiplies the sweep");
+    }
     ui.row("material", &fmt(&scope.material_sizes, |s| format!("{s}B")));
     ui.row("routes", &fmt(&scope.routes, |r| r.as_str().to_string()));
     // Only shown when something actually walks them. A privkey-only scope carries the
@@ -525,6 +616,7 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
         restart: args.restart,
         gpu: args.gpu,
         gpu_batch: args.gpu_batch,
+        offsets: offsets.clone(),
     };
 
     let report = if corpus {
@@ -685,6 +777,10 @@ fn run_verify(ui: &Ui, args: VerifyArgs) -> Result<()> {
         routes: args.routes.clone(),
         paths: args.paths.clone(),
         hash_forms: args.hash_forms.clone(),
+        // `verify` is handed the material itself, so there is no point to expand and no
+        // stream to offset into. A secret found at `--offset 32` verifies as the secret
+        // it is.
+        offset: None,
     };
     overrides.override_scope(&mut scope)?;
 

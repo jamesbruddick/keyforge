@@ -88,23 +88,42 @@ impl Vulnerability for PythonRandom {
         }
     }
 
-    fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>) {
+    fn expand_at(&self, point: Point<'_>, offsets: &[usize], out: &mut Vec<Expanded>) {
         let Point::Integer(n) = point else {
             debug_assert!(false, "python-random does not read a corpus");
             return;
         };
-        let mut rng = Mt19937::from_key(&[n as u32]);
-        let mut material = [0u8; 32];
-        for chunk in material.chunks_exact_mut(4) {
-            chunk.copy_from_slice(&rng.next_u32().to_le_bytes());
+        for &offset in offsets {
+            let mut rng = Mt19937::from_key(&[n as u32]);
+            // One `getrandbits(32)` per four bytes skipped, which is what an earlier
+            // wallet drawn the same way would have consumed. `offset_step` keeps the
+            // length a multiple of four so this is always whole draws.
+            for _ in 0..offset / 4 {
+                rng.next_u32();
+            }
+            let mut material = [0u8; 32];
+            for chunk in material.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&rng.next_u32().to_le_bytes());
+            }
+            out.push(material);
         }
-        out.push(material);
+    }
+
+    /// `getrandbits(32)` is a 32-bit draw, so only whole words are real stream positions.
+    fn offset_step(&self) -> Option<usize> {
+        Some(4)
     }
 
     /// One stream: the byte mapping this scans is a documented assumption about the
     /// script, not a choice between two libraries the way `milksad`'s is.
-    fn kernel(&self) -> Option<KernelSpec> {
-        Some(KernelSpec { source: KERNEL_SOURCE, streams: vec![0], defines: Vec::new() })
+    fn kernel_at(&self, offsets: &[usize]) -> Option<KernelSpec> {
+        // One stream, walked once per offset.
+        Some(KernelSpec {
+            source: KERNEL_SOURCE,
+            streams: vec![0; offsets.len()],
+            offsets: offsets.iter().map(|&o| o as u32).collect(),
+            defines: Vec::new(),
+        })
     }
 }
 

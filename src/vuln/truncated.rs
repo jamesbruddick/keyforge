@@ -95,7 +95,7 @@ impl Vulnerability for TruncatedEntropy {
         }
     }
 
-    fn expand(&self, point: Point<'_>, out: &mut Vec<Expanded>) {
+    fn expand_at(&self, point: Point<'_>, _offsets: &[usize], out: &mut Vec<Expanded>) {
         let Point::Integer(n) = point else {
             debug_assert!(false, "truncated-entropy does not read a corpus");
             return;
@@ -110,10 +110,13 @@ impl Vulnerability for TruncatedEntropy {
 
     /// One stream, and the prefix width goes with it: a kernel that disagreed with the
     /// host about how many bytes are random would scan a different space entirely.
-    fn kernel(&self) -> Option<KernelSpec> {
+    /// No stream to offset into, so one walk at the front of it -- `offset_step` is
+    /// `None`, which is what stops `--offset` reaching here at all.
+    fn kernel_at(&self, _offsets: &[usize]) -> Option<KernelSpec> {
         Some(KernelSpec {
             source: KERNEL_SOURCE,
             streams: vec![0],
+            offsets: vec![0],
             defines: vec![("VULN_RANDOM_PREFIX", format!("{RANDOM_PREFIX}u"))],
         })
     }
