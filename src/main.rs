@@ -450,16 +450,16 @@ fn run_scan(ui: &Ui, args: ScanArgs) -> Result<()> {
     // point and one counted per walk differ by exactly this factor -- which is an easy
     // way to think a sweep is slower than it is.
     let streams = keyforge::scan::engine::streams_of(v, start);
+    let streams_note = match streams {
+        1 => String::new(),
+        n => format!("{n} streams, each walked in full · "),
+    };
     ui.cont(&format!(
-        "{}per point: {}, {}, {}",
-        match streams {
-            1 => String::new(),
-            n => format!("{n} streams, each walked in full · "),
-        },
+        // `pbkdf2` is not pluralised: `pbkdf2s` is not a word anyone writes.
+        "{streams_note}per point: {}, {}, {} pbkdf2",
         plural(scope.probes_per_point(), "probe"),
         plural(scope.ec_ops_per_point(), "key"),
-        // Not pluralised: `pbkdf2s` is not a word anyone writes.
-        format!("{} pbkdf2", ui::commas(scope.pbkdf2_per_point())),
+        ui::commas(scope.pbkdf2_per_point()),
     ));
     ui.row("material", &fmt(&scope.material_sizes, |s| format!("{s}B")));
     ui.row("routes", &fmt(&scope.routes, |r| r.as_str().to_string()));

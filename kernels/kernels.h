@@ -246,14 +246,17 @@ KERNEL k_master(BUF(const u8, entropy, 0), BUF(const u8, bip39_seeds, 1),
 
 KERNEL k_hardened_level(BUF(const u32, parents, 0), BUF(u32, out, 1), CBUF(u32, count, 2),
                         CBUF(u32, children, 3), BUF(const u32, child_values, 4),
-                        CBUF(u32, values_at, 5), CBUF(u32, out_base, 6) GID_PARAM) {
+                        CBUF(u32, values_at, 5), CBUF(u32, out_base, 6),
+                        CBUF(u32, in_base, 7) GID_PARAM) {
     GID_INIT
     if (gid >= count) return;
     // `out_base` is nonzero only for the last segment of a spec, which writes straight
     // into that spec's region of the leaf array rather than into a level buffer.
     u32 base = out_base + gid * children;
 
-    Node p = node_load(parents, gid);
+    // Every spec walking this round shares one level buffer, so a spec reads the slice of
+    // it the host gave it. See the round plan in `gpu::Gpu::walk`.
+    Node p = node_load(parents, in_base + gid);
     if (!p.valid) {
         // A dead parent's slots still have to be written: the level is dense, and whatever
         // the buffer held from the previous launch is not `valid = 0`.
@@ -489,14 +492,17 @@ INLINE Ge affine_at(DEVICE const u32* gej, DEVICE const u32* zinv, u32 i) {
 KERNEL k_ckd_normal(BUF(const u32, parents, 0), BUF(const u32, gej, 1), BUF(const u32, zinv, 2),
                     BUF(u32, out, 3), CBUF(u32, count, 4), CBUF(u32, children, 5),
                     BUF(const u32, child_values, 6), CBUF(u32, values_at, 7),
-                    CBUF(u32, out_base, 8) GID_PARAM) {
+                    CBUF(u32, out_base, 8), CBUF(u32, in_base, 9) GID_PARAM) {
     GID_INIT
     if (gid >= count) return;
     // See `k_hardened_level`: nonzero only for a spec's last segment, which lands in the
     // leaf array directly.
     u32 base = out_base + gid * children;
 
-    Node p = node_load(parents, gid);
+    // The shared level buffer again -- and `gej`/`zinv` are indexed the same way, because
+    // the public keys were taken over the whole round in one batch and this spec's are at
+    // the same offset in it as its parents are in the level.
+    Node p = node_load(parents, in_base + gid);
     if (!p.valid) {
         // A dead parent's slots still have to be written: the level is dense, and whatever
         // the buffer held from the previous launch is not `valid = 0`.
@@ -506,7 +512,7 @@ KERNEL k_ckd_normal(BUF(const u32, parents, 0), BUF(const u32, gej, 1), BUF(cons
 
     Hmac512 key = hmac512_new(p.chain, 32);
     u8 data[37];
-    ge_serialize(affine_at(gej, zinv, gid), data);
+    ge_serialize(affine_at(gej, zinv, in_base + gid), data);
 
     for (u32 c = 0; c < children; c++) {
         u32 index = child_values[values_at + c];

@@ -53,6 +53,36 @@ pub struct Region {
     pub base_per_point: usize,
 }
 
+/// One round of the lockstep walk: every spec that acts at this depth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Round {
+    /// Nodes per point this round's parents occupy in the level buffer.
+    pub width: usize,
+    /// Nodes per point at the front of the buffer that need public keys -- the specs
+    /// taking a normal step. Zero when every step this round is hardened.
+    pub normal_width: usize,
+    pub steps: Vec<Step>,
+}
+
+/// One spec's move within a round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Step {
+    /// Index into [`Layout::specs`].
+    pub spec: usize,
+    /// Which of that spec's segments this walks.
+    pub segment: usize,
+    pub hardened: bool,
+    /// Parent nodes per point this step reads.
+    pub width: usize,
+    /// Whether this is the spec's first round, so its parents are still the master nodes
+    /// and have to be copied into the shared level buffer before it can walk with them.
+    pub joins: bool,
+    /// Whether this is the spec's last segment, whose children are leaves.
+    pub last: bool,
+    /// Where this step's parents sit in the level buffer, per point.
+    pub at: usize,
+}
+
 /// The shape of one launch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
@@ -131,28 +161,94 @@ impl Layout {
         points * self.leaves_per_point()
     }
 
-    /// The widest *intermediate* level any spec produces, which is what the two level
-    /// buffers have to hold.
+    /// The widest level the shared buffer has to hold, per point.
     ///
-    /// Two things make this smaller than it looks. Levels are walked one spec at a time
-    /// and the buffers are reused between them, so this is a maximum rather than a sum.
-    /// And the **last** segment of a spec writes straight into the leaf array rather than
-    /// into a level buffer, so its width does not count here -- which is the widest level
-    /// of all, and including it sized both buffers about ten times too large on the
-    /// default scope. That is memory taken directly out of the batch on the very device
-    /// where memory is what limits it.
+    /// The **last** segment of a spec writes straight into the leaf array rather than into
+    /// a level buffer, so its output does not count here -- which is the widest level of
+    /// all, and including it sized both buffers about ten times too large on the default
+    /// scope. That is memory taken directly out of the batch on the very device where
+    /// memory is what limits it.
+    ///
+    /// It is a *sum* across specs rather than a maximum, because the specs walk in
+    /// lockstep and share one buffer -- see [`rounds`](Self::rounds) for why.
     pub fn level_capacity(&self, points: usize) -> usize {
+        self.rounds().iter().map(|r| r.width).max().unwrap_or(0) * points
+    }
+
+    /// The walk, one round at a time, right-aligned so every spec's last segment falls on
+    /// the last round.
+    ///
+    /// The specs used to be walked one after another, each ping-ponging through the level
+    /// buffers on its own. That made every normal segment its own `public_keys` -- a k*G
+    /// and a batched inversion, six dispatches -- so the default scope issued eight of
+    /// them per launch where one shared walk needs two. Dispatches are not free and these
+    /// were small, and it measured as a 7% loss against the scanner this grew out of,
+    /// which fused its four fixed purposes into one level by construction.
+    ///
+    /// Right-alignment is what makes sharing possible for specs of *different depths*:
+    /// a spec with `n` segments simply starts `maxdepth - n` rounds in, so
+    /// `m/44'/0'/0'/{0,1}/{0..9}` and `m/{0,1}/{0..9}` reach their chain and index levels
+    /// on the same rounds. Aligning from the front would leave the bare spec at its leaf
+    /// level while the others were still in hardened prefix, sharing nothing.
+    ///
+    /// Within a round the specs taking a **normal** step are placed first, so one
+    /// `public_keys` over the prefix `[0, normal_width)` serves all of them and each
+    /// spec's public key sits at the same offset as its parent node.
+    pub fn rounds(&self) -> Vec<Round> {
         let trees = self.masters_per_point();
-        let mut widest = 0usize;
-        for spec in &self.specs {
-            let mut width = 1usize;
-            // `len() - 1`: the final segment's output is a leaf, not a level.
-            for seg in spec.segments().iter().take(spec.depth().saturating_sub(1)) {
-                width *= seg.len();
-                widest = widest.max(trees * width);
-            }
+        if trees == 0 {
+            return Vec::new();
         }
-        widest * points
+        // A spec with no segments at all -- `m`, the master node itself -- has no round to
+        // take: its masters are its leaves and are copied straight across.
+        let walked: Vec<(usize, &PathSpec)> = self
+            .specs
+            .iter()
+            .enumerate()
+            .filter(|(_, spec)| !spec.segments().is_empty())
+            .collect();
+        let depth = walked.iter().map(|(_, s)| s.segments().len()).max().unwrap_or(0);
+
+        let mut out = Vec::new();
+        for round in 0..depth {
+            let mut steps: Vec<Step> = Vec::new();
+            for (spec, path) in &walked {
+                let segments = path.segments();
+                // Right-aligned: this spec joins once its remaining segments fit.
+                let Some(seg) = (round + segments.len()).checked_sub(depth) else {
+                    continue;
+                };
+                if seg >= segments.len() {
+                    continue;
+                }
+                // Nodes per point at the start of this segment.
+                let width: usize =
+                    trees * segments[..seg].iter().map(|s| s.len()).product::<usize>();
+                steps.push(Step {
+                    spec: *spec,
+                    segment: seg,
+                    hardened: segments[seg].hardened,
+                    width,
+                    joins: seg == 0,
+                    last: seg + 1 == segments.len(),
+                    at: 0,
+                });
+            }
+            // Normal steps first, so `public_keys` covers a prefix. Stable within each
+            // group, so a spec's placement is a function of the scope and nothing else.
+            steps.sort_by_key(|s| (s.hardened, s.spec));
+            let mut at = 0usize;
+            let mut normal = 0usize;
+            for step in &mut steps {
+                step.at = at;
+                at += step.width;
+                if !step.hardened {
+                    normal = at;
+                }
+            }
+            out.push(Round { width: at, normal_width: normal, steps });
+        }
+        out
     }
 
     /// Which point a leaf slot belongs to, for a launch of `points` points.
@@ -282,21 +378,97 @@ mod tests {
 
     /// Level buffers are sized to the widest level, not the sum: the walk reuses them
     /// between specs, and a sum would allocate several times what a launch needs on the
-    /// very device where memory is the limit.
+    /// The level buffer holds the widest *round*, which is a sum across specs -- they
+    /// walk in lockstep and share it. It must still be far smaller than the leaf level,
+    /// which is the whole reason the last segment writes past it.
     #[test]
-    fn level_capacity_is_the_widest_level_not_the_sum() {
+    fn level_capacity_is_the_widest_round() {
         let scope = Scope::default();
         let layout = Layout::new(&scope, 1);
-        // The widest intermediate level is the chain level of a BIP44 spec: 3 sizes x
-        // 2 tree routes x 2 chains. The index level below it is four times wider again
-        // and does *not* count, because it writes into the leaf array.
-        assert_eq!(layout.level_capacity(1), 3 * 2 * 2);
+        // The widest round is the one every spec spends at its chain level, feeding the
+        // index level below: 3 sizes x 2 tree routes x 2 chains, for each of the four
+        // specs. The index level itself is wider again and does *not* count, because it
+        // writes into the leaf array.
+        assert_eq!(layout.level_capacity(1), 4 * (3 * 2 * 2));
         assert!(
-            layout.level_capacity(1) * 10 < layout.leaves_per_point(),
+            layout.level_capacity(1) * 5 < layout.leaves_per_point(),
             "level buffers are being sized like the leaf level"
         );
         // And it scales with the launch.
         assert_eq!(layout.level_capacity(8), 8 * layout.level_capacity(1));
+    }
+
+    /// The round plan is what lets one `public_keys` serve every spec, so the properties
+    /// it has to have are worth stating rather than inferring from a throughput number.
+    #[test]
+    fn the_round_plan_is_right_aligned_and_shareable() {
+        let layout = Layout::new(&Scope::default(), 1);
+        let rounds = layout.rounds();
+        // The deepest spec is m/44'/0'/0'/{0,1}/{0..9}: five segments, five rounds.
+        assert_eq!(rounds.len(), 5);
+
+        for (index, round) in rounds.iter().enumerate() {
+            // Normal steps come first, so the prefix `public_keys` covers exactly them.
+            let first_hardened = round
+                .steps
+                .iter()
+                .position(|s| s.hardened)
+                .unwrap_or(round.steps.len());
+            assert!(
+                round.steps[first_hardened..].iter().all(|s| s.hardened),
+                "round {index} interleaves normal and hardened steps"
+            );
+            // Offsets tile the round without gap or overlap.
+            let mut next = 0;
+            for step in &round.steps {
+                assert_eq!(step.at, next, "round {index} leaves a seam");
+                next += step.width;
+            }
+            assert_eq!(next, round.width);
+            assert_eq!(
+                round.normal_width,
+                round.steps.iter().take(first_hardened).map(|s| s.width).sum::<usize>()
+            );
+        }
+
+        // Right-aligned: every spec finishes on the last round, which is what puts all
+        // four at their index level together.
+        let last = rounds.last().unwrap();
+        assert_eq!(last.steps.len(), 4, "every spec should act on the last round");
+        assert!(last.steps.iter().all(|s| s.last && !s.hardened));
+        assert_eq!(last.normal_width, last.width, "the last round is all normal steps");
+
+        // The bare spec has two segments, so it joins two rounds from the end and needs
+        // its masters copied in when it does.
+        let joiners: Vec<_> =
+            rounds.iter().enumerate().flat_map(|(i, r)| r.steps.iter().filter(|s| s.joins).map(move |s| (i, s.spec))).collect();
+        assert!(joiners.contains(&(3, 3)), "the bare spec joins at round 3, got {joiners:?}");
+    }
+
+    /// A step's children must land where the same spec reads them from next round --
+    /// the one thing that, if wrong, silently derives a different tree.
+    #[test]
+    fn a_steps_children_land_where_it_next_reads_them() {
+        for scope in [Scope::default(), narrow()] {
+            let layout = Layout::new(&scope, 1);
+            let rounds = layout.rounds();
+            for (index, round) in rounds.iter().enumerate() {
+                for step in &round.steps {
+                    if step.last {
+                        continue;
+                    }
+                    let next = rounds[index + 1]
+                        .steps
+                        .iter()
+                        .find(|s| s.spec == step.spec)
+                        .expect("an unfinished spec acts again");
+                    // It reads exactly the children this step wrote.
+                    let children = layout.specs[step.spec].segments()[step.segment].len() as usize;
+                    assert_eq!(next.width, step.width * children);
+                    assert_eq!(next.segment, step.segment + 1);
+                }
+            }
+        }
     }
 
     fn narrow() -> Scope {

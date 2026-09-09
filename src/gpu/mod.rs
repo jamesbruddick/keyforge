@@ -874,103 +874,138 @@ impl Gpu {
             )?;
         }
 
-        // Each path spec in turn, one segment at a time.
+        // Every spec together, one round at a time -- see `Layout::rounds`.
         //
         // A hardened segment needs no public key, so it is one dispatch and no EC work at
-        // all. A normal one needs its parents' keys, so it is a k*G over the level, one
-        // batched inversion, and a CKD. The old pipeline had these fixed -- three hardened
-        // steps then exactly two normal ones -- because that was the only tree shape it
-        // walked; a parsed path can be any depth with hardened levels anywhere.
+        // all. A normal one needs its parents' keys: a k*G over the level, one batched
+        // inversion, and a CKD. The specs walk in lockstep and share the level buffer, so
+        // the k*G and the inversion happen **once per round** rather than once per spec
+        // per segment -- eight `public_keys` per launch on the default scope became two.
         //
-        // The two level buffers are swapped between segments, and reused between specs.
-        // The last segment writes straight into this spec's region of the leaf array, so
-        // every leaf ends up where `Layout::point_of` says it is.
+        // The two level buffers are swapped between rounds. A spec's last segment writes
+        // straight into its region of the leaf array, so every leaf ends up where
+        // `Layout::point_of` says it is; right-alignment puts every spec's last segment on
+        // the last round, so they all reach the leaves together.
         let offsets = segment_offsets(&l);
-        for (spec_index, spec) in l.specs.iter().enumerate() {
-            let Some(region) = l.regions.iter().find(|r| r.spec == Some(spec_index)) else {
-                continue;
+        let rounds = l.rounds();
+        for (index, round) in rounds.iter().enumerate() {
+            let (parents, next) = if index % 2 == 0 {
+                (b.level_a, b.level_b)
+            } else {
+                (b.level_b, b.level_a)
             };
-            let segments = spec.segments();
-            let mut parents = b.masters;
-            let mut parents_n = seeds * l.masters_per_point();
-            let mut flip = false;
 
-            for (depth, seg) in segments.iter().enumerate() {
-                let last = depth + 1 == segments.len();
-                // The final level lands in the leaf array; everything above it ping-pongs.
-                let out = if last {
-                    b.leaf_nodes
-                } else if flip {
-                    b.level_b
-                } else {
-                    b.level_a
-                };
-                let leaf_base = region.base_per_point * seeds;
-                let args = u32s(&[
-                    parents_n as u32,
-                    seg.len() as u32,
-                    offsets[spec_index][depth] as u32,
-                    if last { leaf_base as u32 } else { 0 },
-                ]);
-                let (count_a, per_parent, values_at, out_base) =
-                    (&args[0], &args[1], &args[2], &args[3]);
-
-                if seg.hardened {
-                    self.backend.dispatch(
-                        "k_hardened_level",
-                        parents_n,
-                        &[
-                            Arg::Buffer(parents),
-                            Arg::Buffer(out),
-                            Arg::Scalar(count_a),
-                            Arg::Scalar(per_parent),
-                            Arg::Buffer(b.child_values),
-                            Arg::Scalar(values_at),
-                            Arg::Scalar(out_base),
-                        ],
-                    )?;
-                } else {
-                    self.public_keys(parents, parents_n)?;
-                    self.backend.dispatch(
-                        "k_ckd_normal",
-                        parents_n,
-                        &[
-                            Arg::Buffer(parents),
-                            Arg::Buffer(b.gej),
-                            Arg::Buffer(b.zinv),
-                            Arg::Buffer(out),
-                            Arg::Scalar(count_a),
-                            Arg::Scalar(per_parent),
-                            Arg::Buffer(b.child_values),
-                            Arg::Scalar(values_at),
-                            Arg::Scalar(out_base),
-                        ],
-                    )?;
-                }
-
-                parents_n *= seg.len();
-                parents = out;
-                if !last {
-                    flip = !flip;
-                }
-            }
-
-            // A spec with no segments at all -- `m`, the master node itself -- has no level
-            // to walk, so its masters are its leaves and have to be copied into place.
-            if segments.is_empty() {
-                let leaf_base = region.base_per_point * seeds;
-                let args = u32s(&[parents_n as u32, leaf_base as u32]);
+            // A spec joining this round still has its parents in the master array. They
+            // have to be in the shared buffer, at this spec's offset, before one
+            // `public_keys` can cover the round.
+            for step in round.steps.iter().filter(|s| s.joins) {
+                let args = u32s(&[(step.width * seeds) as u32, (step.at * seeds) as u32]);
                 self.backend.dispatch(
                     "k_copy_nodes",
-                    parents_n,
+                    step.width * seeds,
                     &[
+                        Arg::Buffer(b.masters),
                         Arg::Buffer(parents),
-                        Arg::Buffer(b.leaf_nodes),
                         Arg::Scalar(&args[0]),
                         Arg::Scalar(&args[1]),
                     ],
                 )?;
             }
+
+            // One batch for the whole round, over the prefix the normal steps occupy.
+            if round.normal_width > 0 {
+                self.public_keys(parents, round.normal_width * seeds)?;
+            }
+
+            for step in &round.steps {
+                let spec = &l.specs[step.spec];
+                let seg = &spec.segments()[step.segment];
+                let out_base = if step.last {
+                    let region = l
+                        .regions
+                        .iter()
+                        .find(|r| r.spec == Some(step.spec))
+                        .expect("a walked spec has a leaf region");
+                    region.base_per_point * seeds
+                } else {
+                    // Where this spec's children sit in the next round's buffer, which is
+                    // where it will read them from.
+                    rounds[index + 1]
+                        .steps
+                        .iter()
+                        .find(|s| s.spec == step.spec)
+                        .expect("a spec that has not finished acts again next round")
+                        .at
+                        * seeds
+                };
+                let out = if step.last { b.leaf_nodes } else { next };
+                let args = u32s(&[
+                    (step.width * seeds) as u32,
+                    seg.len() as u32,
+                    offsets[step.spec][step.segment] as u32,
+                    out_base as u32,
+                    (step.at * seeds) as u32,
+                ]);
+                let (count, per_parent, values_at, out_base, in_base) =
+                    (&args[0], &args[1], &args[2], &args[3], &args[4]);
+
+                if step.hardened {
+                    self.backend.dispatch(
+                        "k_hardened_level",
+                        step.width * seeds,
+                        &[
+                            Arg::Buffer(parents),
+                            Arg::Buffer(out),
+                            Arg::Scalar(count),
+                            Arg::Scalar(per_parent),
+                            Arg::Buffer(b.child_values),
+                            Arg::Scalar(values_at),
+                            Arg::Scalar(out_base),
+                            Arg::Scalar(in_base),
+                        ],
+                    )?;
+                } else {
+                    self.backend.dispatch(
+                        "k_ckd_normal",
+                        step.width * seeds,
+                        &[
+                            Arg::Buffer(parents),
+                            Arg::Buffer(b.gej),
+                            Arg::Buffer(b.zinv),
+                            Arg::Buffer(out),
+                            Arg::Scalar(count),
+                            Arg::Scalar(per_parent),
+                            Arg::Buffer(b.child_values),
+                            Arg::Scalar(values_at),
+                            Arg::Scalar(out_base),
+                            Arg::Scalar(in_base),
+                        ],
+                    )?;
+                }
+            }
+        }
+
+        // A spec with no segments at all -- `m`, the master node itself -- has no round to
+        // take: its masters are its leaves and only need moving into place.
+        for (spec_index, spec) in l.specs.iter().enumerate() {
+            if !spec.segments().is_empty() {
+                continue;
+            }
+            let Some(region) = l.regions.iter().find(|r| r.spec == Some(spec_index)) else {
+                continue;
+            };
+            let n = seeds * l.masters_per_point();
+            let args = u32s(&[n as u32, (region.base_per_point * seeds) as u32]);
+            self.backend.dispatch(
+                "k_copy_nodes",
+                n,
+                &[
+                    Arg::Buffer(b.masters),
+                    Arg::Buffer(b.leaf_nodes),
+                    Arg::Scalar(&args[0]),
+                    Arg::Scalar(&args[1]),
+                ],
+            )?;
         }
 
         // Keys with no derivation join at the leaf level and share its inversion, written
